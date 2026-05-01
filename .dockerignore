@@ -1,0 +1,16 @@
+# 依赖与构建产物在镜像内部生成.
+node_modules
+dist
+
+# 环境变量由部署系统注入, 不打进镜像.
+.env
+.env.*
+
+# Git / IDE / OS 杂项.
+.git
+.gitignore
+.idea
+.DS_Store
+
+# 文档不参与运行.
+*.md

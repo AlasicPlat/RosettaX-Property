@@ -1,0 +1,28 @@
+# compiled output
+/dist
+
+# TypeScript build artifacts in src
+src/**/*.js
+src/**/*.d.ts
+src/**/*.js.map
+!src/test.js
+
+# dependencies
+/node_modules
+node_modules
+
+OPS-MANUAL.md
+SERVER-SETUP.md
+
+# IDE
+/.idea
+.DS_Store
+
+# env
+*.env
+# .env.*
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
