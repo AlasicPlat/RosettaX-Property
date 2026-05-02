@@ -13,7 +13,7 @@ import { ProxyConfig, ProxyProvider } from './proxy-config.interface';
  * 切换到 iProyal (geo.iproyal.com:11201) 作为主代理服务商.
  *
  * iProyal 代理规则:
- * - 基础用户名: sSNXhZIJ1oVvnwia, 密码: CyCvcdZ3ZLEcpgnz
+ * - 基础用户名和密码从环境变量读取
  * - SOCKS5: geo.iproyal.com:11201, protocol: socks5://
  * - 每次使用基础凭证访问, 服务商随机分配 IP
  * - Sticky session 通过密码后缀实现:
@@ -79,9 +79,11 @@ export class IProyalProxyService implements ProxyProvider {
     this.sessionLifetime = this.configService.get<string>('IPROYAL_SESSION_LIFETIME', '30m');
     this.sessionTtlSeconds = SESSION_LIFETIME_TO_SECONDS[this.sessionLifetime] || 1800;
 
+    const isActiveProvider = this.configService.get<string>('PROXY_PROVIDER', 'iproyal') === 'iproyal';
     if (!this.baseUsername || !this.basePassword) {
+      if (!isActiveProvider) return;
       this.logger.error('IPROYAL_USERNAME 或 IPROYAL_PASSWORD 未配置, 代理服务将无法正常工作');
-    } else {
+    } else if (isActiveProvider) {
       this.logger.log(
         `✓ iProyal 代理已初始化: ${this.host}:${this.port}, username=${this.baseUsername}, lifetime=${this.sessionLifetime}`,
       );
@@ -142,7 +144,7 @@ export class IProyalProxyService implements ProxyProvider {
    *
    * @returns 代理配置
    */
-  acquireRandom(): ProxyConfig {
+  async acquireRandom(): Promise<ProxyConfig> {
     return {
       protocol: 'socks5',
       host: this.host,
@@ -161,7 +163,7 @@ export class IProyalProxyService implements ProxyProvider {
    * @param sessionTag sticky session 标识
    * @returns 对应的代理配置
    */
-  getConfigForSessionTag(sessionTag: string): ProxyConfig {
+  async getConfigForSessionTag(sessionTag: string): Promise<ProxyConfig> {
     return this.buildConfig(sessionTag);
   }
 

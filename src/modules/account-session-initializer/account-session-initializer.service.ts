@@ -4,7 +4,6 @@ import {
   CookieJarService,
   HttpProxyService,
 } from '../http-proxy';
-import { DistributedLockService } from '../distributed-cache';
 import { ShldDispatcherService } from '../algorithm/shld-dispatcher.service';
 import { ProxyConfig } from '../proxy/proxy-config.interface';
 import { AccountSessionCacheService } from '../account-session-cache/account-session-cache.service';
@@ -13,10 +12,33 @@ import {
   AccountSessionContext,
   QueryResult,
 } from './account-session-context.interface';
-import {
-  buildInterfaceResponseLog,
-  maskLogIdentifier,
-} from '../../utils/interface-response-log.util';
+
+/** 查询 session 初始化阶段, 用于持久化失败原因. */
+export type QuerySessionInitializationStage = 'cache' | 'context' | 'login' | 'init' | 'cache_write';
+
+/**
+ * @description 查询 session 初始化结果.
+ */
+export interface QuerySessionInitializationResult {
+  /** true 表示查询 session 已存在或初始化成功 */
+  success: boolean;
+  /** 当前结果发生的阶段 */
+  stage: QuerySessionInitializationStage;
+  /** 内部业务返回码 */
+  code?: number;
+  /** init/login 流程位置 */
+  pos?: number;
+  /** Apple/代理 HTTP 状态码 */
+  responseCode?: number;
+  /** 可展示的失败原因 */
+  errorMessage?: string;
+}
+
+/** 查询 session 初始化遇到临时网络/代理失败时的最大尝试次数. */
+const QUERY_SESSION_INITIALIZATION_MAX_ATTEMPTS = Math.max(
+  1,
+  Number.parseInt(process.env.ROSETTAX_QUERY_SESSION_INIT_ATTEMPTS || '3', 10) || 3,
+);
 
 /**
  * @file account-session-initializer.service.ts
@@ -38,14 +60,12 @@ export class AccountSessionInitializerService {
    * @param httpProxyService 代理 HTTP 客户端
    * @param cookieJarService Cookie 容器工厂
    * @param shldDispatcherService SHLD PoW 调度器
-   * @param lockService 分布式锁服务, 防止同一账号地区并发初始化
    * @param sessionCacheService 查询 session 缓存服务
    */
   constructor(
     private readonly httpProxyService: HttpProxyService,
     private readonly cookieJarService: CookieJarService,
     private readonly shldDispatcherService: ShldDispatcherService,
-    private readonly lockService: DistributedLockService,
     private readonly sessionCacheService: AccountSessionCacheService,
   ) { }
 
@@ -140,8 +160,6 @@ export class AccountSessionInitializerService {
   ): Promise<QueryResult> {
     const ret: QueryResult = { code: 0, pos: 0, errMsg: '', responseCode: -1 };
 
-    // this.logger.log(`[loginAccount] 开始登录 — 账号池大小: ${context.accountInfoList.length}, nextAccount: ${nextAccount}, 当前索引: ${context.currentAccountIndex}`);
-
     // 账号池为空检查
     if (context.accountInfoList.length === 0) {
       this.logger.error('[loginAccount] 账号列表为空');
@@ -156,7 +174,6 @@ export class AccountSessionInitializerService {
       } else {
         context.currentAccountIndex = 0;
       }
-      this.logger.log(`[loginAccount] 切换账号 → 索引: ${context.currentAccountIndex}`);
     }
 
     const url = 'https://idmsa.apple.com/authenticate';
@@ -170,11 +187,8 @@ export class AccountSessionInitializerService {
       const accStr = context.accountInfoList[context.currentAccountIndex].acc;
       const pwdStr = context.accountInfoList[context.currentAccountIndex].pwd;
 
-      // this.logger.log(`[loginAccount] 尝试账号 [${context.currentAccountIndex}]: ${accStr.substring(0, 6)}***`);
-
       // 跳过已标记为不可用的账号 — 避免重复尝试已知失败的账号
       if (!context.accountInfoList[context.currentAccountIndex].available) {
-        this.logger.log(`[loginAccount] ${accStr.substring(0, 6)}*** 缓存检测不可用, 跳过`);
         if (context.currentAccountIndex < context.accountInfoList.length - 1) {
           context.currentAccountIndex++;
         } else {
@@ -219,8 +233,6 @@ export class AccountSessionInitializerService {
         return { ...ret, code: 1000, errMsg: `登录-请求失败: ${error.message}` };
       }
 
-      // this.logger.log(`[loginAccount] HTTP 响应状态码: ${result.status}, Set-Cookie 数量: ${(result.headers['set-cookie'] || []).length}`);
-
       // IP 被风控 (HTTP 503) — 自动切换代理后重试当前账号
       if (result.status === 503) {
         proxySwitchTimes++;
@@ -232,8 +244,7 @@ export class AccountSessionInitializerService {
           return { ...ret, code: 503, responseCode: 503, errMsg: `连续${proxySwitchTimes}次切换代理仍被风控(503)` };
         }
         this.logger.warn(`[loginAccount] IP 被风控 (503), 自动切换代理重试 (${proxySwitchTimes}/${MAX_PROXY_SWITCH_TIMES})`);
-        proxy = this.httpProxyService.acquireRandomProxy();
-        this.logger.log(`[loginAccount] 切换到新代理: sessionTag=${proxy.sessionTag || 'random'}, ${proxy.host}:${proxy.port}`);
+        proxy = await this.httpProxyService.acquireRandomProxy();
         // 不切换账号, 用新 IP 重试同一个账号 — 503 是 IP 问题而非账号问题
         continue;
       }
@@ -242,18 +253,6 @@ export class AccountSessionInitializerService {
       const setCookies = result.headers['set-cookie'] as string[] | undefined;
       const loginCookies = new CookieContainer();
       loginCookies.mergeFromSetCookieHeaders(setCookies);
-      this.logger.log(buildInterfaceResponseLog(
-        'context.loginAccount.response',
-        result,
-        undefined,
-        {
-          method: 'POST',
-          url,
-          account: maskLogIdentifier(accStr),
-          loginCookieCount: loginCookies.size,
-          hasMyacinfo: loginCookies.isExist('myacinfo'),
-        },
-      ));
 
       if (!loginCookies.isExist('myacinfo')) {
         // 登录失败: myacinfo cookie 不存在
@@ -276,7 +275,6 @@ export class AccountSessionInitializerService {
         success = false;
       } else {
         // 登录成功: 缓存 cookies 供后续使用
-        // this.logger.log(`[loginAccount] ✅ ${accStr.substring(0, 6)}*** 登录成功! cookies 数量: ${(setCookies || []).length}`);
         context.accountInfoList[context.currentAccountIndex].isLogin = true;
         context.accountInfoList[context.currentAccountIndex].available = true;
 
@@ -331,11 +329,8 @@ export class AccountSessionInitializerService {
     ret.pos++;
     const urlSuffix = 'com';
     const balanceUrl = `https://secure.store.apple.${urlSuffix}${context.countryURL}/shop/giftcard/balance`;
-    // this.logger.log(`[initContext] ── 步骤1: 进入查询页面 — 地区: ${context.countryURL}, URL: ${balanceUrl}`);
-
     // 合并当前账号的登录 cookies 到请求容器
     const currentAccount = context.accountInfoList[context.currentAccountIndex];
-    // this.logger.log(`[initContext] 当前账号: ${currentAccount.acc.substring(0, 6)}***, loginCookies 数量: ${currentAccount.loginCookies.size}, isLogin: ${currentAccount.isLogin}`);
 
     // 使用 CookieContainer 的方式合并
     const loginContainer = this.cookieJarService.createContainer();
@@ -343,7 +338,6 @@ export class AccountSessionInitializerService {
       loginContainer.mergeFromSetCookieHeaders([`${name}=${value}`]);
     }
     cookies.mergeFrom(loginContainer);
-    // this.logger.log(`[initContext] cookies 合并完成, 总 cookie 数量: ${cookies.size}`);
     // this.logger.debug(`[initContext] Cookie 字符串长度: ${cookies.toRequestString().length}`);
 
     let result;
@@ -367,7 +361,6 @@ export class AccountSessionInitializerService {
       return { ...ret, code: 1000, errMsg: `进入查询页面-请求失败: ${error.message}` };
     }
 
-    // this.logger.log(`[initContext] 查询页面响应 — 状态码: ${result.status}, 数据长度: ${typeof result.data === 'string' ? result.data.length : 'N/A'}`);
 
     // 风控检测 — 541 和 503 都是 IP 级别的风控
     if (result.status === 541 || result.status === 503) {
@@ -392,18 +385,6 @@ export class AccountSessionInitializerService {
       context.internalReturnCode = 1;
       return { ...ret, code: 1, errMsg: '没找到init_data，返回代码1' };
     }
-    this.logger.log(buildInterfaceResponseLog(
-      'context.init.balance-page.initData',
-      result,
-      initData,
-      {
-        method: 'GET',
-        url: balanceUrl,
-        account: maskLogIdentifier(currentAccount.acc),
-        accumulatedCookieCount: cookies.size,
-      },
-    ));
-    // this.logger.log('[initContext] ✅ init_data 解析成功');
 
     let xAosStk: string;
     let callbackSignInUrl: string;
@@ -415,8 +396,6 @@ export class AccountSessionInitializerService {
       return { ...ret, code: 2, errMsg: 'json解析失败，返回代码2' };
     }
 
-    // this.logger.log(`[initContext] x-aos-stk: ${xAosStk ? xAosStk.substring(0, 20) + '...' : '(空)'}, callbackSignInUrl: ${callbackSignInUrl || '(空)'}`);
-
     if (!callbackSignInUrl) {
       this.logger.error('[initContext] 回调登录 URL 为空');
       context.internalReturnCode = 2;
@@ -425,12 +404,9 @@ export class AccountSessionInitializerService {
 
     // 从回调 URL 提取 pod 编号 (如 secure6.store → pod = "6")
     const pod = this.extractPod(callbackSignInUrl);
-    // this.logger.log(`[initContext] ── 步骤2: SHLD PoW 验证 — pod: ${pod}`);
-
     // ── 步骤2: SHLD PoW 验证 (通过 ShldDispatcherService) ──
     ret.pos++;
     const shldResult = await this.shldDispatcherService.dispatch({ pod, cookies, proxy });
-    // this.logger.log(`[initContext] SHLD 结果 — success: ${shldResult.success}, code: ${shldResult.code}`);
     if (!shldResult.success) {
       context.internalReturnCode = shldResult.code;
       if (shldResult.code === 541) context.beRiskCtrl = true;
@@ -444,7 +420,6 @@ export class AccountSessionInitializerService {
 
     // ── 步骤3: 登录验证 — POST 到回调 URL ──
     ret.pos++;
-    // this.logger.log(`[initContext] ── 步骤3: 登录验证 — POST ${callbackSignInUrl}`);
     let verifyResult;
     try {
       verifyResult = await this.httpProxyService.requestWithProxy({
@@ -479,7 +454,6 @@ export class AccountSessionInitializerService {
       return { ...ret, code: 1000, errMsg: `登录验证-请求失败: ${error.message}` };
     }
 
-    // this.logger.log(`[initContext] 登录验证响应 — 状态码: ${verifyResult.status}`);
     cookies.mergeFromSetCookieHeaders(verifyResult.headers['set-cookie']);
     // 这一步请求会删除登录 cookies, 需要重新合并 — 与源码 L1657 行为一致
     cookies.mergeFrom(loginContainer);
@@ -501,34 +475,11 @@ export class AccountSessionInitializerService {
         ? JSON.parse(verifyResult.data)
         : verifyResult.data;
     } catch {
-      this.logger.log(buildInterfaceResponseLog(
-        'context.init.verify-signin.response',
-        verifyResult,
-        undefined,
-        {
-          method: 'POST',
-          url: callbackSignInUrl,
-          account: maskLogIdentifier(currentAccount.acc),
-          accumulatedCookieCount: cookies.size,
-        },
-      ));
       context.internalReturnCode = 9;
       return { ...ret, code: 9, errMsg: '获取登录成功后的地址-JSON解析失败' };
     }
-    this.logger.log(buildInterfaceResponseLog(
-      'context.init.verify-signin.response',
-      verifyResult,
-      verifyData,
-      {
-        method: 'POST',
-        url: callbackSignInUrl,
-        account: maskLogIdentifier(currentAccount.acc),
-        accumulatedCookieCount: cookies.size,
-      },
-    ));
 
     let nextUrl: string = verifyData?.head?.data?.url || '';
-    // this.logger.log(`[initContext] 跳转 URL: ${nextUrl || '(空)'}`);
     if (!nextUrl) {
       context.internalReturnCode = 9;
       return { ...ret, code: 9, errMsg: '获取登录成功后的地址为空' };
@@ -543,7 +494,6 @@ export class AccountSessionInitializerService {
 
     // ── 步骤4: 登录完成, 获取查询页面 — 同样使用手动重定向收集 cookies ──
     ret.pos++;
-    // this.logger.log(`[initContext] ── 步骤4: 登录完成, 获取查询页面 — GET ${nextUrl}`);
     let queryPageResult;
     try {
       // ★ 步骤4也使用 requestWithCookies(), 跳转页面可能有额外重定向
@@ -578,23 +528,11 @@ export class AccountSessionInitializerService {
     // 从查询页面提取 x-as-actk 和查询 URL
     const queryPageHtml = typeof queryPageResult.data === 'string' ? queryPageResult.data : String(queryPageResult.data);
     const queryInitData = this.extractInitData(queryPageHtml);
-    // this.logger.log(`[initContext] 查询页面响应 — 状态码: ${queryPageResult.status}, 数据长度: ${queryPageHtml.length}`);
     if (!queryInitData) {
       this.logger.warn('[initContext] ❌ 查询页面 init_data 获取失败');
       context.internalReturnCode = 11;
       return { ...ret, code: 11, errMsg: '登录完成即将查询-init_data获取失败' };
     }
-    this.logger.log(buildInterfaceResponseLog(
-      'context.init.login-completed-page.initData',
-      queryPageResult,
-      queryInitData,
-      {
-        method: 'GET',
-        url: nextUrl,
-        account: maskLogIdentifier(currentAccount.acc),
-        accumulatedCookieCount: cookies.size,
-      },
-    ));
 
     let xAsActk: string;
     let queryUrl: string;
@@ -621,9 +559,6 @@ export class AccountSessionInitializerService {
     context.x_as_actk = xAsActk;
     context.internalReturnCode = 0;
 
-    this.logger.log(`[initContext] ✅ 上下文初始化完成 — queryURL: ${queryUrl}`);
-    // this.logger.log(`[initContext] x-aos-stk: ${xAosStk.substring(0, 20)}..., x-as-actk: ${xAsActk ? xAsActk.substring(0, 20) + '...' : '(空)'}`);
-    // this.logger.log(`[initContext] cookies 总量: ${cookies.size}`);
     return { ...ret, code: 0 };
   }
 
@@ -683,47 +618,150 @@ export class AccountSessionInitializerService {
     countryURL: string,
     accounts: Array<{ email: string; password: string; accountKey?: string; groupId?: number | null }>,
   ): Promise<boolean> {
-    // 获取分布式锁 — 防止与正常查询或其他 Pod 冲突
-    const lock = await this.lockService.acquire(cacheKey);
+    const result = await this.initializeQuerySessionDetailed(cacheKey, countryURL, accounts);
+    return result.success;
+  }
 
-    try {
-      // 如果已经有缓存了 (可能被其他 Pod 抢先初始化), 直接返回
-      const hasExisting = await this.sessionCacheService.hasValidSession(cacheKey);
-      if (hasExisting) {
-        this.logger.log(`[warmup] session 已存在, 跳过预热: key=${cacheKey}`);
-        return true;
+  /**
+   * @description 初始化可缓存的查询 session, 并返回结构化失败原因.
+   * @param cacheKey 目标 cacheKey
+   * @param countryURL 区域路径
+   * @param accounts 账号列表 (目标账号在首位)
+   * @returns 初始化结果, 包含失败阶段、返回码和错误消息
+   * @sideEffects 成功时写入 Redis 查询 session; 失败时仅返回诊断信息
+   */
+  async initializeQuerySessionDetailed(
+    cacheKey: string,
+    countryURL: string,
+    accounts: Array<{ email: string; password: string; accountKey?: string; groupId?: number | null }>,
+  ): Promise<QuerySessionInitializationResult> {
+    const hasExisting = await this.sessionCacheService.hasValidSession(cacheKey);
+    if (hasExisting) return { success: true, stage: 'cache' };
+
+    let lastResult: QuerySessionInitializationResult | null = null;
+    for (let attempt = 1; attempt <= QUERY_SESSION_INITIALIZATION_MAX_ATTEMPTS; attempt++) {
+      const result = await this.initializeQuerySessionAttempt(cacheKey, countryURL, accounts);
+      if (result.success) return result;
+
+      lastResult = result;
+      if (attempt >= QUERY_SESSION_INITIALIZATION_MAX_ATTEMPTS || !this.shouldRetryInitialization(result)) {
+        return result;
       }
 
-      const context = this.createContextFromAccounts(countryURL, accounts);
-      if (!context) return false;
+      this.logger.warn(
+        `[warmup] 初始化遇到可重试失败: key=${cacheKey}, ` +
+        `attempt=${attempt}/${QUERY_SESSION_INITIALIZATION_MAX_ATTEMPTS}, ` +
+        `stage=${result.stage}, code=${result.code ?? 'n/a'}, ` +
+        `response=${result.responseCode ?? 'n/a'}, err=${result.errorMessage || 'unknown'}`,
+      );
+    }
 
-      const cookies = this.cookieJarService.createContainer();
-      const proxy = this.httpProxyService.acquireRandomProxy();
+    return lastResult || {
+      success: false,
+      stage: 'context',
+      errorMessage: '查询 session 初始化失败',
+    };
+  }
 
-      // Step 1: 登录
+  /**
+   * @description 执行单次查询 session 初始化尝试.
+   * @param cacheKey 目标 cacheKey
+   * @param countryURL 区域路径
+   * @param accounts 账号列表 (目标账号在首位)
+   * @returns 单次初始化结果
+   * @sideEffects 成功时写入 Redis 查询 session; 失败时仅返回诊断信息
+   */
+  private async initializeQuerySessionAttempt(
+    cacheKey: string,
+    countryURL: string,
+    accounts: Array<{ email: string; password: string; accountKey?: string; groupId?: number | null }>,
+  ): Promise<QuerySessionInitializationResult> {
+
+    const context = this.createContextFromAccounts(countryURL, accounts);
+    if (!context) {
+      return {
+        success: false,
+        stage: 'context',
+        code: 14,
+        errorMessage: '账号列表为空, 无法创建查询上下文',
+      };
+    }
+
+    const cookies = this.cookieJarService.createContainer();
+    try {
+      const proxy = await this.httpProxyService.acquireRandomProxy();
       const loginResult = await this.loginAccount(context, false, proxy);
       if (loginResult.code !== 0) {
-        cookies.destroy();
-        this.logger.warn(`[warmup] 登录失败: key=${cacheKey}, code=${loginResult.code}`);
-        return false;
+        this.logger.warn(
+          `[warmup] 登录失败: key=${cacheKey}, code=${loginResult.code}, ` +
+          `pos=${loginResult.pos}, err=${loginResult.errMsg}`,
+        );
+        return {
+          success: false,
+          stage: 'login',
+          code: loginResult.code,
+          pos: loginResult.pos,
+          responseCode: loginResult.responseCode,
+          errorMessage: loginResult.errMsg || '登录失败',
+        };
       }
 
-      // Step 2: 初始化上下文
-      const initResult = await this.initContext(context, cookies, this.httpProxyService.acquireRandomProxy());
+      const initResult = await this.initContext(context, cookies, await this.httpProxyService.acquireRandomProxy());
       if (initResult.code !== 0) {
-        cookies.destroy();
         this.logger.warn(`[warmup] 初始化失败: key=${cacheKey}, code=${initResult.code}, pos=${initResult.pos}, err=${initResult.errMsg}`);
-        return false;
+        return {
+          success: false,
+          stage: 'init',
+          code: initResult.code,
+          pos: initResult.pos,
+          responseCode: initResult.responseCode,
+          errorMessage: initResult.errMsg || '查询上下文初始化失败',
+        };
       }
 
-      // 缓存 session 到 Redis — 后续查询可直接使用
-      await this.sessionCacheService.saveSession(cacheKey, context, cookies);
-      cookies.destroy(); // 序列化后释放本地副本
-      this.logger.log(`[warmup] ✅ 预热完成: key=${cacheKey}`);
-      return true;
+      try {
+        await this.sessionCacheService.saveSession(cacheKey, context, cookies);
+        return { success: true, stage: 'cache_write' };
+      } catch (error: any) {
+        this.logger.warn(`[warmup] 查询 session 保存失败: key=${cacheKey} — ${error.message}`);
+        return {
+          success: false,
+          stage: 'cache_write',
+          errorMessage: `查询 session 保存失败: ${error.message}`,
+        };
+      }
     } finally {
-      await lock.release();
+      cookies.destroy();
     }
+  }
+
+  /**
+   * @description 判断查询 session 初始化失败是否属于临时网络/代理问题.
+   *
+   * 账号密码错误、2FA 或 Apple 明确拒绝不应重试; 502/503/541、网络断连和
+   * timeout 通常与代理出口或 Apple 临时响应有关, 可以换代理重试。
+   *
+   * @param result 查询 session 初始化结果
+   * @returns true 表示可以重试
+   */
+  private shouldRetryInitialization(result: QuerySessionInitializationResult): boolean {
+    if (result.success) return false;
+
+    const retryableResponseCodes = new Set([429, 500, 502, 503, 504, 520, 522, 524, 541]);
+    if (result.responseCode !== undefined && retryableResponseCodes.has(result.responseCode)) {
+      return true;
+    }
+
+    const message = String(result.errorMessage || '').toLowerCase();
+    return result.code === 1000 || [
+      'socket hang up',
+      'timeout',
+      'timed out',
+      'econnreset',
+      'econnrefused',
+      'etimedout',
+      'proxy connection timed out',
+    ].some((token) => message.includes(token));
   }
 
 }

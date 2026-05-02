@@ -2,6 +2,7 @@ import { Module, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DecodoProxyService } from './decodo-proxy.service';
 import { IProyalProxyService } from './iproyal-proxy.service';
+import { SeekProxyService } from './seekproxy.service';
 import { PROXY_PROVIDER } from './proxy-config.interface';
 
 /**
@@ -9,6 +10,7 @@ import { PROXY_PROVIDER } from './proxy-config.interface';
  *
  * 通过 PROXY_PROVIDER 环境变量动态选择代理服务商:
  *   - 'iproyal' (默认): IProyalProxyService
+ *   - 'seekproxy': SeekProxyService
  *   - 'decodo': DecodoProxyService
  *
  * 消费者通过 @Inject(PROXY_PROVIDER) 获取 ProxyProvider 实例,
@@ -21,10 +23,12 @@ import { PROXY_PROVIDER } from './proxy-config.interface';
   providers: [
     DecodoProxyService,
     IProyalProxyService,
+    SeekProxyService,
     {
       provide: PROXY_PROVIDER,
       useFactory: (
         config: ConfigService,
+        seekproxy: SeekProxyService,
         iproyal: IProyalProxyService,
         decodo: DecodoProxyService,
       ) => {
@@ -33,16 +37,20 @@ import { PROXY_PROVIDER } from './proxy-config.interface';
         logger.log(`✓ 代理服务商: ${provider.toUpperCase()}`);
 
         switch (provider) {
+          case 'seekproxy':
+            return seekproxy;
           case 'decodo':
             return decodo;
           case 'iproyal':
+            return iproyal;
           default:
+            logger.warn(`未知代理服务商 ${provider}, 回退到 iProyal`);
             return iproyal;
         }
       },
-      inject: [ConfigService, IProyalProxyService, DecodoProxyService],
+      inject: [ConfigService, SeekProxyService, IProyalProxyService, DecodoProxyService],
     },
   ],
-  exports: [PROXY_PROVIDER, DecodoProxyService, IProyalProxyService],
+  exports: [PROXY_PROVIDER, DecodoProxyService, IProyalProxyService, SeekProxyService],
 })
 export class ProxyModule {}

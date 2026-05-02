@@ -69,4 +69,27 @@ export type LoginQueueTask =
     reason: string;
     /** 任务创建时间戳 */
     requestedAt: number;
+    /** RosettaX 投递锁 token, Property 处理完成后用它精确释放锁 */
+    dedupeToken?: string;
+  }
+  | {
+    /** 按用户组 DB 账号和已保存预热地区增量补齐查询 session */
+    type: 'group_warmup';
+    /** 用户组 ID */
+    groupId: number | null;
+    /** 当前业务缺失的地区路径 */
+    requestedRegion?: string;
+    /** 当前需要直接重建上下文的账号; 缺省时只做用户组容量补齐 */
+    requestedAccount?: {
+      email: string;
+      password: string;
+      accountKey?: string;
+      groupId?: number | null;
+    };
+    /** 调度原因 */
+    reason: string;
+    /** 任务创建时间戳 */
+    requestedAt: number;
+    /** RosettaX 投递锁 token, Property 处理完成后用它精确释放锁 */
+    dedupeToken?: string;
   };

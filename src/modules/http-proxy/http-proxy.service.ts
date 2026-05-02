@@ -1,4 +1,5 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import axios, { AxiosRequestConfig, AxiosResponse } from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -28,9 +29,9 @@ export interface ProxyRequestConfig extends AxiosRequestConfig {
  * 4. 支持无代理直连模式 (useProxy: false)
  * 5. requestWithCookies(): 手动跟随重定向, 逐跳收集 cookies — 解决 axios 重定向丢 cookie 问题
  *
- * 20260423 重构说明:
- * - 代理服务商从 Decodo 切换到 iProyal (连接更稳定)
- * - 代理配置由调用方传入 ProxyConfig (从 IProyalProxyService 获取)
+ * 20260502 重构说明:
+ * - 代理服务商切换到 SeekProxy
+ * - 随机代理获取改为异步提取, 每次 acquireRandomProxy() 都请求供应商获取新 IP
  * - 代理状态完全内存化, 零 DB 依赖
  */
 /** Agent 缓存条目 */
@@ -43,10 +44,20 @@ interface CachedAgent {
 const AGENT_CACHE_TTL_MS = 10 * 60 * 1000;
 /** Agent 缓存清理间隔 (2 分钟) */
 const AGENT_CLEANUP_INTERVAL_MS = 2 * 60 * 1000;
+/** 默认出口 IP 查询接口 */
+const DEFAULT_EXIT_IP_CHECK_URL = 'https://api.ipify.org?format=json';
+/** 默认出口 IP 查询超时 */
+const DEFAULT_EXIT_IP_CHECK_TIMEOUT_MS = 5000;
 
 @Injectable()
 export class HttpProxyService {
   private readonly logger = new Logger(HttpProxyService.name);
+  /** 是否开启出口 IP 日志; 开启后每次代理请求前会额外发起一次 IP 查询请求 */
+  private readonly exitIpLogEnabled: boolean;
+  /** 出口 IP 查询接口, 必须返回 JSON { ip } 或纯文本 IP */
+  private readonly exitIpCheckUrl: string;
+  /** 出口 IP 查询超时时间 */
+  private readonly exitIpCheckTimeoutMs: number;
 
   /**
    * Per-sessionTag Agent 缓存 — 复用 SOCKS5+TLS 连接, 省去重复握手开销 (~1-1.5s).
@@ -54,13 +65,23 @@ export class HttpProxyService {
    * Key: sessionTag (空字符串 = 随机 IP, 不缓存)
    * Value: { agent, createdAt }
    *
-   * 同一个 sessionTag 对应同一个 Decodo 出口 IP (24h 内),
+   * 同一个 sessionTag 对应同一个供应商 sticky 出口 IP,
    * 复用 Agent 仅复用 TCP/TLS 连接, 不影响 IP 分配逻辑.
    */
   private readonly agentCache = new Map<string, CachedAgent>();
   private agentCleanupTimer: NodeJS.Timeout | null = null;
 
-  constructor(@Inject(PROXY_PROVIDER) private readonly proxyService: ProxyProvider) {
+  constructor(
+    @Inject(PROXY_PROVIDER) private readonly proxyService: ProxyProvider,
+    private readonly configService: ConfigService,
+  ) {
+    this.exitIpLogEnabled = this.readBooleanConfig('PROXY_EXIT_IP_LOG_ENABLED', false);
+    this.exitIpCheckUrl = this.configService.get<string>('PROXY_EXIT_IP_CHECK_URL', DEFAULT_EXIT_IP_CHECK_URL);
+    this.exitIpCheckTimeoutMs = this.readPositiveIntegerConfig(
+      'PROXY_EXIT_IP_CHECK_TIMEOUT_MS',
+      DEFAULT_EXIT_IP_CHECK_TIMEOUT_MS,
+    );
+
     // 定时清理过期 Agent
     this.agentCleanupTimer = setInterval(() => {
       this.pruneExpiredAgents();
@@ -73,11 +94,11 @@ export class HttpProxyService {
    * @description 获取一个随机 IP 代理配置 — 用于无需 sticky session 的场景.
    *
    * 替代原 acquireProxy() 的 "随机选取" 语义.
-   * 返回 Decodo 随机 IP 配置 (每次请求不同 IP).
+   * 返回供应商随机 IP 配置 (每次请求不同 IP).
    *
-   * @returns 随机 IP 的代理配置 (非 null, Decodo 网关保证可用)
+   * @returns 随机 IP 的代理配置
    */
-  acquireRandomProxy(): ProxyConfig {
+  async acquireRandomProxy(): Promise<ProxyConfig> {
     return this.proxyService.acquireRandom();
   }
 
@@ -112,7 +133,7 @@ export class HttpProxyService {
    *
    * 工作流程:
    * 1. 检查是否需要代理 (useProxy 参数)
-   * 2. 使用 Decodo 随机 IP 代理, 构建 Agent 附加到 axios config
+   * 2. 使用供应商随机 IP 代理, 构建 Agent 附加到 axios config
    * 3. 发送请求, 失败则自动重试 (每次获取新随机 IP)
    *
    * @param config 请求配置 (继承 AxiosRequestConfig, 扩展代理参数)
@@ -136,8 +157,8 @@ export class HttpProxyService {
     // 重试循环: 每次使用新的随机 IP
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        // 每次重试使用新的随机 IP (Decodo 基础用户名模式)
-        const proxyConfig = this.acquireRandomProxy();
+        // 每次重试都重新向供应商提取代理, 保证切换出口 IP
+        const proxyConfig = await this.acquireRandomProxy();
 
         const agent = this.createAgent(
           proxyConfig.protocol,
@@ -146,6 +167,7 @@ export class HttpProxyService {
           proxyConfig.username,
           proxyConfig.password,
         );
+        await this.logExitIpIfEnabled(proxyConfig, agent, 'request', attempt + 1, axiosConfig.url);
 
         const requestConfig: AxiosRequestConfig = {
           ...axiosConfig,
@@ -205,6 +227,7 @@ export class HttpProxyService {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         const agent = this.getOrCreateAgent(proxy);
+        await this.logExitIpIfEnabled(proxy, agent, 'requestWithProxy', attempt + 1, axiosConfig.url);
 
         const requestConfig: AxiosRequestConfig = {
           ...axiosConfig,
@@ -266,6 +289,12 @@ export class HttpProxyService {
     let currentUrl = axiosConfig.url!;
     let currentMethod = (axiosConfig.method || 'GET').toUpperCase();
     let response: AxiosResponse<T>;
+    let proxyAgent: any | null = null;
+
+    if (useProxy && proxy) {
+      proxyAgent = this.getOrCreateAgent(proxy);
+      await this.logExitIpIfEnabled(proxy, proxyAgent, 'requestWithCookies', 1, currentUrl);
+    }
 
     for (let hop = 0; hop < maxHops; hop++) {
       const requestCookieCount = cookies.size;
@@ -286,10 +315,9 @@ export class HttpProxyService {
       };
 
       // 附加代理 Agent — 复用缓存的 Agent 以省去 SOCKS5+TLS 握手
-      if (useProxy && proxy) {
-        const agent = this.getOrCreateAgent(proxy);
-        hopConfig.httpAgent = agent;
-        hopConfig.httpsAgent = agent;
+      if (proxyAgent) {
+        hopConfig.httpAgent = proxyAgent;
+        hopConfig.httpsAgent = proxyAgent;
       }
 
       response = await axios(hopConfig);
@@ -298,19 +326,19 @@ export class HttpProxyService {
       cookies.mergeFromSetCookieHeaders(response.headers['set-cookie']);
       cookies.removeEmptyCookies();
 
-      if (interfaceLogLabel) {
-        this.logger.log(buildInterfaceResponseLog(
-          `${interfaceLogLabel}.hop${hop + 1}`,
-          response,
-          undefined,
-          {
-            method: currentMethod,
-            url: currentUrl,
-            requestCookieCount,
-            accumulatedCookieCount: cookies.size,
-          },
-        ));
-      }
+      // if (interfaceLogLabel) {
+      //   this.logger.log(buildInterfaceResponseLog(
+      //     `${interfaceLogLabel}.hop${hop + 1}`,
+      //     response,
+      //     undefined,
+      //     {
+      //       method: currentMethod,
+      //       url: currentUrl,
+      //       requestCookieCount,
+      //       accumulatedCookieCount: cookies.size,
+      //     },
+      //   ));
+      // }
 
       // 非 3xx 重定向, 返回最终响应
       if (response.status < 300 || response.status >= 400) {
@@ -360,7 +388,7 @@ export class HttpProxyService {
    * - 利用 HTTP Keep-Alive 复用已建立的 TCP 连接
    * - 预计每次请求节省 ~1-1.5s
    *
-   * @param proxy Decodo 代理配置
+   * @param proxy 代理配置
    * @returns Agent 实例 (可能是缓存的)
    */
   private getOrCreateAgent(proxy: ProxyConfig): any {
@@ -402,6 +430,124 @@ export class HttpProxyService {
     }
 
     return new HttpsProxyAgent(proxyUrl, { timeout: 15000, keepAlive: true });
+  }
+
+  /**
+   * @description 按配置记录真实出口 IP.
+   *
+   * 通过传入的同一个代理 Agent 请求出口 IP 查询接口, 用于确认当前代理链路的
+   * 公网出口。查询失败只记录 warn, 不影响业务请求。
+   *
+   * @param proxy 当前业务请求使用的代理配置
+   * @param agent 当前业务请求使用的代理 Agent
+   * @param scope 调用场景
+   * @param attempt 当前请求尝试次数
+   * @param targetUrl 业务请求目标 URL, 仅用于日志定位
+   * @sideEffects 可能发起一次额外 HTTP 请求并写日志
+   */
+  private async logExitIpIfEnabled(
+    proxy: ProxyConfig,
+    agent: any,
+    scope: string,
+    attempt: number,
+    targetUrl?: string,
+  ): Promise<void> {
+    if (!this.exitIpLogEnabled) return;
+
+    try {
+      const response = await axios.get(this.exitIpCheckUrl, {
+        httpAgent: agent,
+        httpsAgent: agent,
+        proxy: false,
+        timeout: this.exitIpCheckTimeoutMs,
+        validateStatus: () => true,
+      });
+      const exitIp = this.extractExitIp(response.data);
+      const targetHost = this.extractHostForLog(targetUrl);
+
+      this.logger.log(
+        `[ExitIP] scope=${scope}, attempt=${attempt}, exitIp=${exitIp || 'unknown'}, target=${targetHost}, proxy=${this.maskProxyForLog(proxy)}, status=${response.status}`,
+      );
+    } catch (error: any) {
+      this.logger.warn(
+        `[ExitIP] 查询失败: scope=${scope}, attempt=${attempt}, proxy=${this.maskProxyForLog(proxy)}, error=${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * @description 从出口 IP 查询接口响应中提取 IP.
+   *
+   * @param payload 响应体, 支持 { ip } JSON 或纯文本
+   * @returns 提取到的 IP, 失败返回空字符串
+   */
+  private extractExitIp(payload: any): string {
+    if (!payload) return '';
+    if (typeof payload === 'string') return payload.trim();
+    if (typeof payload.ip === 'string') return payload.ip.trim();
+    return '';
+  }
+
+  /**
+   * @description 读取布尔配置.
+   *
+   * @param key 配置键
+   * @param fallback 默认值
+   * @returns 解析后的布尔值
+   */
+  private readBooleanConfig(key: string, fallback: boolean): boolean {
+    const value = this.configService.get<string>(key);
+    if (value === undefined) return fallback;
+    return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+  }
+
+  /**
+   * @description 读取正整数配置.
+   *
+   * @param key 配置键
+   * @param fallback 默认值
+   * @returns 正整数配置值
+   */
+  private readPositiveIntegerConfig(key: string, fallback: number): number {
+    const value = Number(this.configService.get<string>(key, String(fallback)));
+    return Number.isInteger(value) && value > 0 ? value : fallback;
+  }
+
+  /**
+   * @description 提取日志可用的目标 host, 避免输出完整 URL 泄露业务参数.
+   *
+   * @param targetUrl 请求 URL
+   * @returns host 或 unknown
+   */
+  private extractHostForLog(targetUrl?: string): string {
+    if (!targetUrl) return 'unknown';
+    try {
+      return new URL(targetUrl).host;
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  /**
+   * @description 脱敏代理标识, 避免日志输出代理密码和完整账号.
+   *
+   * @param proxy 代理配置
+   * @returns 可安全记录的代理标识
+   */
+  private maskProxyForLog(proxy: ProxyConfig): string {
+    const username = proxy.username ? this.maskCredential(proxy.username) : 'none';
+    return `${proxy.protocol}://${username}:***@${proxy.host}:${proxy.port},tag=${proxy.sessionTag || 'random'}`;
+  }
+
+  /**
+   * @description 脱敏凭证字符串.
+   *
+   * @param value 原始凭证
+   * @returns 脱敏凭证
+   */
+  private maskCredential(value: string): string {
+    if (value.length <= 6) return '***';
+    return `${value.slice(0, 3)}***${value.slice(-3)}`;
   }
 
   /**

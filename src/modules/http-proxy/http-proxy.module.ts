@@ -8,7 +8,7 @@ import { CookieJarService } from './cookie-jar.service';
  *
  * 设计意图: 作为全局模块, 任何业务模块可直接注入 HttpProxyService 发起代理请求,
  * 无需关心代理选取、Agent 构建、故障切换等底层细节.
- * 依赖 ProxyModule 获取 DecodoProxyService.
+ * 依赖 ProxyModule 获取当前启用的 ProxyProvider.
  */
 @Global()
 @Module({

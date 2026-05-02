@@ -2,7 +2,7 @@
  * @file proxy-config.interface.ts
  * @description 代理配置通用接口 + 代理服务商抽象接口.
  *
- * 所有代理服务商 (Decodo, iProyal, ...) 的配置对象都实现 ProxyConfig 接口,
+ * 所有代理服务商 (Decodo, iProyal, SeekProxy, ...) 的配置对象都实现 ProxyConfig 接口,
  * 所有代理服务商的 Service 都实现 ProxyProvider 接口.
  * 上层消费者 (HttpProxyService, SessionManagerService 等) 只依赖这两个接口.
  *
@@ -16,10 +16,10 @@
  * @description 代理配置接口 — 代理服务商无关.
  *
  * 设计意图: 解耦代理服务商实现与上层消费者.
- * 无论底层使用 Decodo 还是 iProyal, 上层只看到统一的 ProxyConfig.
+ * 无论底层使用 Decodo、iProyal 还是 SeekProxy, 上层只看到统一的 ProxyConfig.
  */
 export interface ProxyConfig {
-  /** 代理协议 — socks5 / socks5h / https */
+  /** 代理协议 — http / socks5 / socks5h / https */
   protocol: string;
   /** 代理服务器域名 */
   host: string;
@@ -39,7 +39,7 @@ export interface ProxyConfig {
 /**
  * @description 代理服务商抽象接口 — Strategy Pattern.
  *
- * 设计意图: 所有代理服务商 (iProyal, Decodo, 未来的新服务商) 必须实现此接口.
+ * 设计意图: 所有代理服务商 (iProyal, Decodo, SeekProxy, 未来的新服务商) 必须实现此接口.
  * 消费者通过 @Inject(PROXY_PROVIDER) 获取实例, 无需关心底层是哪个服务商.
  *
  * 方法语义说明:
@@ -53,9 +53,9 @@ export interface ProxyProvider {
   /** 为指定账号获取 sticky session 代理 */
   acquireForAccount(email: string): Promise<ProxyConfig>;
   /** 获取随机 IP 代理 — 每次请求使用不同出口 IP */
-  acquireRandom(): ProxyConfig;
+  acquireRandom(): Promise<ProxyConfig>;
   /** 根据已有 sessionTag 构建代理配置 */
-  getConfigForSessionTag(sessionTag: string): ProxyConfig;
+  getConfigForSessionTag(sessionTag: string): Promise<ProxyConfig>;
   /** 释放账号的 session 映射 */
   releaseSession(email: string): Promise<void>;
   /** 轮换代理 session — 故障时获得新出口 IP */
@@ -66,6 +66,6 @@ export interface ProxyProvider {
  * NestJS 注入 token — 消费者通过 @Inject(PROXY_PROVIDER) 获取 ProxyProvider 实例.
  *
  * ProxyModule 的 useFactory 会根据 PROXY_PROVIDER 环境变量
- * 动态绑定到 IProyalProxyService 或 DecodoProxyService.
+ * 动态绑定到当前启用的代理服务商实现.
  */
 export const PROXY_PROVIDER = Symbol('PROXY_PROVIDER');

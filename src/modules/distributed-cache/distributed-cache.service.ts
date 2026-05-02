@@ -989,22 +989,35 @@ export class DistributedCacheService {
   /**
    * @description 设置账号当前绑定的地区 — 强制唯一, 覆盖旧值.
    *
-   * saveToCache 调用时写入, 确保同一时刻一个账号只有一个地区上下文.
+   * saveToCache 调用时写入, 确保同一时刻一个账号只有一个地区上下文。
+   * 当账号从旧地区切换到新地区时, 同步删除旧地区 session 和 warmed set 成员,
+   * 避免旧索引让后续预热容量判断误以为该账号仍可服务旧地区。
    *
    * @param email 账号邮箱
    * @param regionPath 地区路径 (如 '/us')
    * @param ttlMs TTL 毫秒数 (应与 SESSION_CACHE_TTL_MS 一致)
+   * @sideEffects 写入账号地区绑定; 必要时删除旧地区 session 和预热索引成员
    */
   async setAccountRegion(
     email: string,
     regionPath: string,
     ttlMs: number,
   ): Promise<void> {
-    const redisKey = CACHE_KEYS.ACCOUNT_REGION.build(email.toLowerCase());
+    const accountIdentity = email.toLowerCase();
+    const redisKey = CACHE_KEYS.ACCOUNT_REGION.build(accountIdentity);
     const ttlSeconds = Math.ceil(ttlMs / 1000);
 
     try {
-      await this.redisService.getClient().set(redisKey, regionPath, 'EX', ttlSeconds);
+      const previousRegionPath = await this.redisService.get(redisKey);
+      const pipeline = this.redisService.getClient().pipeline();
+      pipeline.set(redisKey, regionPath, 'EX', ttlSeconds);
+
+      if (previousRegionPath && previousRegionPath !== regionPath) {
+        pipeline.del(CACHE_KEYS.SESSION.build(`${accountIdentity}:${previousRegionPath}`));
+        pipeline.srem(CACHE_KEYS.WARMED_ACCOUNT.build(previousRegionPath), accountIdentity);
+      }
+
+      await pipeline.exec();
     } catch (error: any) {
       this.logger.warn(
         `[cache] 账号地区绑定设置失败: email=${email}, region=${regionPath} — ${error.message}`,

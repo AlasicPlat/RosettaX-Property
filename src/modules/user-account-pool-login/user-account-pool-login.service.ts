@@ -5,12 +5,12 @@ import { RedisService } from '../../database/redis.service';
 import { CACHE_KEYS } from '../../constants/cache-keys.constants';
 import {
   DistributedCacheService,
-  DistributedLockService,
   SerializedPoolEntry,
 } from '../distributed-cache';
 import { LoginResultDto } from '../itunes-client/interfaces/managed-session.interface';
 import { ItunesClientService } from '../itunes-client/itunes-client.service';
 import { SessionManagerService } from '../itunes-client/session-manager.service';
+import { AppleInitializationLimiterService } from '../apple-initialization-limiter/apple-initialization-limiter.service';
 import { UserAccountPoolIdentityService } from '../user-account-pool-core/user-account-pool-identity.service';
 import { UserAccountPoolStateService } from '../user-account-pool-state/user-account-pool-state.service';
 import {
@@ -19,10 +19,23 @@ import {
   LoginWarmupRunOptions,
   PoolEntry,
   RELOGIN_EXPIRED_BATCH_LIMIT,
-  RELOGIN_LOCK_TTL_MS,
   UserLoginResult,
   WarmupAccountCredential,
 } from '../user-account-pool-core/user-account-pool.types';
+
+/**
+ * @description 解析正整数环境变量.
+ * @param key 环境变量名
+ * @param fallback 默认值
+ * @returns 合法正整数或默认值
+ */
+function parsePositiveIntEnv(key: string, fallback: number): number {
+  const value = Number.parseInt(process.env[key] || '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** 单 Property worker 内账号登录并发数. */
+const LOGIN_CONCURRENCY = parsePositiveIntEnv('ROSETTAX_PROPERTY_LOGIN_CONCURRENCY', 5);
 
 /**
  * @description GiftCardExchanger 兑换账号登录结果.
@@ -61,14 +74,15 @@ export interface ExchangeAccountLoginResult {
 @Injectable()
 export class UserAccountPoolLoginService {
   private readonly logger = new Logger(UserAccountPoolLoginService.name);
+  private readonly activeReloginKeys = new Set<string>();
 
   constructor(
     private readonly sessionManager: SessionManagerService,
     private readonly itunesClient: ItunesClientService,
+    private readonly initializationLimiter: AppleInitializationLimiterService,
     private readonly redisService: RedisService,
     private readonly eventEmitter: EventEmitter2,
     private readonly cacheService: DistributedCacheService,
-    private readonly lockService: DistributedLockService,
     private readonly identityService: UserAccountPoolIdentityService,
     private readonly stateService: UserAccountPoolStateService,
   ) { }
@@ -141,17 +155,22 @@ export class UserAccountPoolLoginService {
     warmupRegions?: string[],
     options: LoginWarmupRunOptions = {},
   ): Promise<UserLoginResult[]> {
-    const results: UserLoginResult[] = [];
+    const results = await this.mapWithConcurrencyLimit(
+      accounts,
+      LOGIN_CONCURRENCY,
+      (account) => this.loginSingleAccount(account.email, account.password, groupId, account.twoFAUrl),
+    );
 
-    for (const account of accounts) {
-      const result = await this.loginSingleAccount(account.email, account.password, groupId, account.twoFAUrl);
-      results.push(result);
-      if (options.jobId) {
-        await this.recordLoginJobResult(options.jobId, result);
-      }
+    if (options.jobId) {
+      await this.cacheService.updateLoginWarmupJob(options.jobId, {
+        loginFinished: results.length,
+        loginSuccess: results.filter((result) => result.status === 'success').length,
+        loginFailed: results.filter((result) => result.status === 'failed').length,
+        loginNeeds2fa: results.filter((result) => result.status === 'needs_2fa').length,
+      });
     }
 
-    await this.emitBatchLoginCompleted(results, groupId, warmupRegions, options);
+    await this.emitBatchLoginCompleted(results, groupId, warmupRegions, options, accounts);
     return results;
   }
 
@@ -200,14 +219,19 @@ export class UserAccountPoolLoginService {
     if (!entry || !entry.sessionId) {
       return { email, status: 'failed', errorMessage: '未找到待验证的会话' };
     }
+    const sessionId = entry.sessionId;
 
     try {
-      const result = await this.sessionManager.submit2FA(
-        entry.sessionId,
-        emailKey,
-        entry.password,
-        code,
-        groupId,
+      const result = await this.initializationLimiter.run(
+        `submit-2fa:${accountKey}`,
+        'realtime',
+        () => this.sessionManager.submit2FA(
+          sessionId,
+          emailKey,
+          entry.password,
+          code,
+          groupId,
+        ),
       );
 
       if (result.status === 'success' && result.sessionId) {
@@ -265,12 +289,14 @@ export class UserAccountPoolLoginService {
   /**
    * @description 扫描过期或 Redis managed session 丢失的账号, 并后台 relogin.
    * @param limit 本轮最多调度的账号数量
+   * @param groupId 用户组 ID; undefined 表示扫描所有用户组
    * @returns 扫描和调度数量
    */
   async reloginExpiredAccounts(
     limit: number = RELOGIN_EXPIRED_BATCH_LIMIT,
+    groupId?: number | null,
   ): Promise<{ scanned: number; scheduled: number }> {
-    const accounts = await this.cacheService.getAllAccounts();
+    const accounts = await this.cacheService.getAllAccounts(groupId);
     let scanned = 0;
     let scheduled = 0;
 
@@ -278,26 +304,31 @@ export class UserAccountPoolLoginService {
       if (scheduled >= limit) break;
       scanned++;
 
-      const groupId = account.groupId ?? null;
+      const effectiveGroupId = account.groupId ?? groupId ?? null;
       if (account.status === 'expired') {
-        this.scheduleRelogin(account, groupId, 'poll expired account');
+        this.scheduleRelogin(account, effectiveGroupId, 'poll expired account');
         scheduled++;
         continue;
       }
 
-      if (account.status !== 'active' || !account.sessionId) {
+      if (account.status === 'active' && !account.sessionId) {
+        this.scheduleRelogin(account, effectiveGroupId, 'active account missing managed session');
+        scheduled++;
         continue;
       }
 
-      const session = await this.sessionManager.getSession(account.sessionId);
+      if (account.status !== 'active') {
+        continue;
+      }
+
+      const sessionId = account.sessionId;
+      if (!sessionId) continue;
+
+      const session = await this.sessionManager.getSession(sessionId);
       if (!session || session.status !== 'logged_in') {
-        await this.expireAndScheduleRelogin(account.email, groupId, 'managed session missing');
+        await this.expireAndScheduleRelogin(account.email, effectiveGroupId, 'managed session missing');
         scheduled++;
       }
-    }
-
-    if (scheduled > 0) {
-      this.logger.log(`[UserPool] relogin 扫描完成: scanned=${scanned}, scheduled=${scheduled}`);
     }
 
     return { scanned, scheduled };
@@ -339,11 +370,21 @@ export class UserAccountPoolLoginService {
         continue;
       }
 
-      if (account.status !== 'active' || !account.sessionId) {
+      if (account.status === 'active' && !account.sessionId) {
+        this.scheduleRelogin(account, effectiveGroupId, 'active refresh missing managed session');
+        scheduled++;
+        missing++;
         continue;
       }
 
-      const redisKey = CACHE_KEYS.MANAGED_SESSION.build(account.sessionId);
+      if (account.status !== 'active') {
+        continue;
+      }
+
+      const sessionId = account.sessionId;
+      if (!sessionId) continue;
+
+      const redisKey = CACHE_KEYS.MANAGED_SESSION.build(sessionId);
       const ttlSeconds = await this.redisService.getClient().ttl(redisKey);
       if (ttlSeconds === -2) {
         await this.expireAndScheduleRelogin(account.email, effectiveGroupId, 'active refresh managed session missing');
@@ -362,14 +403,6 @@ export class UserAccountPoolLoginService {
         scheduled++;
         expiring++;
       }
-    }
-
-    if (scheduled > 0) {
-      this.logger.log(
-        `[UserPool] active managed session 刷新扫描完成: ` +
-        `groupId=${groupId ?? 'global'}, scanned=${scanned}, scheduled=${scheduled}, ` +
-        `missing=${missing}, expiring=${expiring}`,
-      );
     }
 
     return { scanned, scheduled, missing, expiring };
@@ -411,47 +444,40 @@ export class UserAccountPoolLoginService {
   }
 
   /**
-   * @description 将单账号登录结果累计到任务摘要.
-   * @param jobId 任务 ID
-   * @param result 单账号登录结果
-   */
-  private async recordLoginJobResult(jobId: string, result: UserLoginResult): Promise<void> {
-    await this.cacheService.incrementLoginWarmupJob(jobId, {
-      loginFinished: 1,
-      loginSuccess: result.status === 'success' ? 1 : 0,
-      loginFailed: result.status === 'failed' ? 1 : 0,
-      loginNeeds2fa: result.status === 'needs_2fa' ? 1 : 0,
-    });
-  }
-
-  /**
    * @description 异步发出批量登录完成事件 — 触发高频地区 session 预热.
    * @param results 批量登录结果列表
    * @param groupId 用户组 ID
    * @param warmupRegions 可选预热地区路径列表
    * @param options 登录任务选项
+   * @param sourceAccounts 本次登录的原始账号输入, 用于避免登录后再逐个读取 Redis 账号池
    */
   private async emitBatchLoginCompleted(
     results: UserLoginResult[],
     groupId: number | null = null,
     warmupRegions?: string[],
     options: LoginWarmupRunOptions = {},
+    sourceAccounts: LoginWarmupAccountInput[] = [],
   ): Promise<void> {
-    const successEmails = results
-      .filter((result) => result.status === 'success')
-      .map((result) => result.email.toLowerCase());
-
+    const inputByEmail = new Map(sourceAccounts.map((account) => [account.email.toLowerCase(), account]));
     const enriched: WarmupAccountCredential[] = [];
-    for (const email of successEmails) {
+    for (const result of results) {
+      if (result.status !== 'success') continue;
+
+      const email = result.email.toLowerCase();
       const accountKey = this.identityService.buildAccountIdentity(email, groupId);
+      const inputAccount = inputByEmail.get(email);
+      if (inputAccount) {
+        enriched.push({ email, password: inputAccount.password, accountKey, groupId });
+        continue;
+      }
+
       const entry = await this.cacheService.getAccount(accountKey);
-      if (entry) {
+      if (entry?.password) {
         enriched.push({ email: entry.email, password: entry.password, accountKey, groupId });
       }
     }
 
     if (enriched.length === 0) {
-      this.logger.log('[UserPool] 无成功登录的账号, 跳过预热事件');
       return;
     }
 
@@ -462,12 +488,37 @@ export class UserAccountPoolLoginService {
     }
 
     setImmediate(() => {
-      try {
-        this.eventEmitter.emit('batch-login.completed', payload);
-      } catch (error: any) {
-        this.logger.error(`[UserPool] 发送预热事件异常: ${error.message}`);
-      }
+      this.eventEmitter.emitAsync('batch-login.completed', payload)
+        .catch((error: any) => {
+          this.logger.error(`[UserPool] 发送预热事件异常: ${error.message}`, error.stack);
+        });
     });
+  }
+
+  /**
+   * @description 使用固定并发处理数组, 保持返回结果顺序和输入一致.
+   * @param items 输入列表
+   * @param concurrency 最大并发数
+   * @param handler 单项处理函数
+   * @returns 按输入顺序排列的处理结果
+   */
+  private async mapWithConcurrencyLimit<T, R>(
+    items: T[],
+    concurrency: number,
+    handler: (item: T, index: number) => Promise<R>,
+  ): Promise<R[]> {
+    const results = new Array<R>(items.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(Math.max(1, concurrency), items.length);
+
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex++;
+        results[currentIndex] = await handler(items[currentIndex], currentIndex);
+      }
+    }));
+
+    return results;
   }
 
   /**
@@ -490,8 +541,11 @@ export class UserAccountPoolLoginService {
     const startedAt = Date.now();
 
     try {
-      this.logger.log(`[ExchangeLogin] 登录兑换账号: ${emailKey}`);
-      const loginResult = await this.sessionManager.login(emailKey, password, { groupId });
+      const loginResult = await this.initializationLimiter.run(
+        `exchange-login:${emailKey}`,
+        'realtime',
+        () => this.sessionManager.login(emailKey, password, { groupId }),
+      );
 
       if (loginResult.status === 'success' && loginResult.sessionId) {
         const storeFront = loginResult.account?.storeFront || '';
@@ -506,11 +560,6 @@ export class UserAccountPoolLoginService {
           balanceError = error.message || '余额刷新失败';
           this.logger.warn(`[ExchangeLogin] 余额刷新失败: ${emailKey} — ${balanceError}`);
         }
-
-        this.logger.log(
-          `[ExchangeLogin] ✓ 登录完成: email=${emailKey}, region=${region || 'unknown'}, ` +
-          `balance=${balance || 'N/A'}, elapsed=${Date.now() - startedAt}ms`,
-        );
 
         return {
           email: emailKey,
@@ -640,8 +689,11 @@ export class UserAccountPoolLoginService {
     const accountKey = this.identityService.buildAccountIdentity(emailKey, groupId);
 
     try {
-      this.logger.log(`[UserPool] 登录: ${email}`);
-      const loginResult = await this.sessionManager.login(email, password, { groupId });
+      const loginResult = await this.initializationLimiter.run(
+        `account-login:${accountKey}`,
+        'realtime',
+        () => this.sessionManager.login(email, password, { groupId }),
+      );
 
       if (loginResult.status === 'success' && loginResult.sessionId) {
         return await this.handleLoginSuccess(accountKey, emailKey, password, twoFAUrl, loginResult, groupId);
@@ -742,10 +794,6 @@ export class UserAccountPoolLoginService {
     await this.stateService.addToPool(accountKey, entry);
     this.stateService.initUsageCounter(accountKey).catch(() => { });
 
-    this.logger.log(
-      `[UserPool] ✓ 登录成功: ${emailKey}, region=${region}, balance=${entry.creditDisplay}`,
-    );
-
     return {
       email: emailKey,
       status: 'success',
@@ -799,28 +847,23 @@ export class UserAccountPoolLoginService {
   ): Promise<void> {
     const emailKey = email.toLowerCase();
     const accountKey = this.identityService.buildAccountIdentity(emailKey, groupId);
-    const lock = await this.lockService.tryAcquire(`relogin:${accountKey}`, RELOGIN_LOCK_TTL_MS);
-
-    if (!lock) {
-      this.logger.debug(`[UserPool] relogin 已在执行, 跳过: ${emailKey}`);
+    if (this.activeReloginKeys.has(accountKey)) {
       return;
     }
 
+    this.activeReloginKeys.add(accountKey);
     try {
       const latest = await this.cacheService.getAccount(accountKey);
       if (!forceRefresh && latest?.status === 'active' && latest.sessionId) {
-        this.logger.debug(`[UserPool] relogin 跳过, 账号已恢复: ${emailKey}`);
         return;
       }
 
-      this.logger.log(`[UserPool] 后台 relogin 开始: ${emailKey}, reason=${reason}, force=${forceRefresh}`);
       const result = forceRefresh
         ? await this.refreshActiveAccountWithoutInvalidating(emailKey, password, twoFAUrl, groupId, reason)
         : await this.loginSingleAccount(emailKey, password, groupId, twoFAUrl);
 
       if (result.status === 'success') {
         await this.emitBatchLoginCompleted([result], groupId, undefined, { awaitWarmup: false });
-        this.logger.log(`[UserPool] 后台 relogin 成功: ${emailKey}`);
         return;
       }
 
@@ -828,7 +871,7 @@ export class UserAccountPoolLoginService {
         `[UserPool] 后台 relogin 未成功: ${emailKey}, status=${result.status}, error=${result.errorMessage || 'none'}`,
       );
     } finally {
-      await lock.release();
+      this.activeReloginKeys.delete(accountKey);
     }
   }
 
@@ -855,10 +898,13 @@ export class UserAccountPoolLoginService {
     reason: string,
   ): Promise<UserLoginResult> {
     const accountKey = this.identityService.buildAccountIdentity(emailKey, groupId);
-    const loginResult = await this.sessionManager.login(emailKey, password, { groupId });
+    const loginResult = await this.initializationLimiter.run(
+      `managed-refresh:${accountKey}`,
+      'realtime',
+      () => this.sessionManager.login(emailKey, password, { groupId }),
+    );
 
     if (loginResult.status === 'success' && loginResult.sessionId) {
-      this.logger.log(`[UserPool] active managed session 无感刷新成功: ${emailKey}, reason=${reason}`);
       return this.handleLoginSuccess(accountKey, emailKey, password, twoFAUrl, loginResult, groupId);
     }
 

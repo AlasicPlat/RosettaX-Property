@@ -68,6 +68,7 @@ export interface PoolStatus {
     usageCount: number;
     creditDisplay?: string;
     name?: string;
+    errorMessage?: string;
   }>;
 }
 

@@ -1,6 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import { TypeOrmModuleOptions } from '@nestjs/typeorm';
 import { AppleAccount } from '../entities/apple-account.entity';
+import { GroupWarmUpRecord } from '../entities/group_warm_up_record.entity';
 
 /**
  * @description 从环境变量读取数字配置, 避免 ConfigService 泛型误导导致字符串被直接透传.
@@ -14,6 +15,29 @@ export function getNumberConfig(configService: ConfigService, key: string, fallb
   const parsedValue = Number(rawValue);
 
   return Number.isFinite(parsedValue) ? parsedValue : fallback;
+}
+
+/**
+ * @description 解析 TypeORM 日志级别, 默认仅保留 SQL 错误日志.
+ *
+ * Property 会在批量登录和上下文初始化期间执行大量账号查询; 生产环境逐条输出
+ * query 日志会放大 Docker stdout 压力, 也会掩盖真正的预热/修复日志。
+ *
+ * @param configService Nest 配置服务.
+ * @returns TypeORM logging 配置.
+ */
+export function resolveTypeOrmLogging(configService: ConfigService): TypeOrmModuleOptions['logging'] {
+  const rawValue = String(configService.get<string>('TYPEORM_LOGGING', 'error')).trim().toLowerCase();
+
+  if (rawValue === 'true' || rawValue === 'query') {
+    return ['query', 'error'];
+  }
+
+  if (rawValue === 'all') {
+    return 'all';
+  }
+
+  return ['error'];
 }
 
 /**
@@ -36,7 +60,7 @@ export function createMysqlOptions(configService: ConfigService): TypeOrmModuleO
     username: configService.get<string>('MYSQL_USER', 'app'),
     password: configService.get<string>('MYSQL_PASSWORD', 'app123'),
     database: configService.get<string>('MYSQL_DATABASE', 'oppotunity'),
-    entities: [AppleAccount],
+    entities: [AppleAccount, GroupWarmUpRecord],
     synchronize: false,
     charset: 'utf8mb4',
     timezone: '+08:00',
@@ -44,7 +68,7 @@ export function createMysqlOptions(configService: ConfigService): TypeOrmModuleO
     acquireTimeout: getNumberConfig(configService, 'MYSQL_ACQUIRE_TIMEOUT_MS', 10000),
     retryAttempts: getNumberConfig(configService, 'MYSQL_RETRY_ATTEMPTS', 10),
     retryDelay: getNumberConfig(configService, 'MYSQL_RETRY_DELAY_MS', 3000),
-    logging: ['query', 'error'],
+    logging: resolveTypeOrmLogging(configService),
     extra: {
       waitForConnections: true,
       connectionLimit,

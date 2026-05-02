@@ -188,17 +188,6 @@ export const CACHE_KEYS = {
   USER_ACCOUNT_LOGIN_TASK_STREAM: 'rx:stream:user-account-login',
 
   /**
-   * 用户账号登录任务去重锁.
-   * Key 格式: `rx:login-task-dedup:{dedupKey}`
-   * Value: '1'
-   * TTL: 按任务类型设置
-   */
-  USER_ACCOUNT_LOGIN_TASK_DEDUP: {
-    PREFIX: 'rx:login-task-dedup:',
-    build: (dedupKey: string): string => `rx:login-task-dedup:${dedupKey}`,
-  },
-
-  /**
    * 用户组业务活跃心跳 — RosettaX 写入, RosettaX-Property 读取后决定是否维持无感刷新.
    * Key 格式: `rx:group-activity:{groupKey}`
    * Value: Hash { groupKey, groupId, source, lastSeenAt, updatedAt }

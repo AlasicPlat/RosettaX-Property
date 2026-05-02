@@ -206,6 +206,7 @@ export class UserAccountPoolStateService {
         usageCount: a.usageCount,
         creditDisplay: a.creditDisplay,
         name: a.name,
+        errorMessage: a.errorMessage,
       })),
     };
   }

@@ -238,18 +238,18 @@ export class ItunesClientService {
 
       // 302 重定向 — 对标 Java L375-382
       if (response.status === 302) {
-        this.logger.log(buildInterfaceResponseLog(
-          'itunes.login.redirect',
-          response,
-          undefined,
-          {
-            method: 'POST',
-            url: currentUrl,
-            attempt,
-            account: maskLogIdentifier(email),
-            sessionCookieCount: sessionCookies.size,
-          },
-        ));
+        // this.logger.log(buildInterfaceResponseLog(
+        //   'itunes.login.redirect',
+        //   response,
+        //   undefined,
+        //   {
+        //     method: 'POST',
+        //     url: currentUrl,
+        //     attempt,
+        //     account: maskLogIdentifier(email),
+        //     sessionCookieCount: sessionCookies.size,
+        //   },
+        // ));
         const location = response.headers?.location;
         if (location) {
           this.logger.log(`  302 重定向 → ${location}`);
@@ -268,18 +268,18 @@ export class ItunesClientService {
         }
       }
 
-      this.logger.log(buildInterfaceResponseLog(
-        'itunes.login.response',
-        response,
-        result ?? undefined,
-        {
-          method: 'POST',
-          url: currentUrl,
-          attempt,
-          account: maskLogIdentifier(email),
-          sessionCookieCount: sessionCookies.size,
-        },
-      ));
+      // this.logger.log(buildInterfaceResponseLog(
+      //   'itunes.login.response',
+      //   response,
+      //   result ?? undefined,
+      //   {
+      //     method: 'POST',
+      //     url: currentUrl,
+      //     attempt,
+      //     account: maskLogIdentifier(email),
+      //     sessionCookieCount: sessionCookies.size,
+      //   },
+      // ));
 
       if (result) {
         const failureType = result.failureType as string | undefined;

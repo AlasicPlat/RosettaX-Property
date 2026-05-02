@@ -132,6 +132,9 @@ export class SessionManagerService {
             options.groupId ?? existing.groupId ?? null,
             existingAccount,
           );
+        } else if (existingAccount && existingAccount.password !== password) {
+          await this.accountService.upsert({ email: normalizedEmail, password });
+          this.logger.log(`[SessionManager] 已更新现有账号明文密码: ${normalizedEmail}`);
         }
         return {
           status: 'success',
@@ -144,7 +147,7 @@ export class SessionManagerService {
     }
 
     // 随机代理
-    const proxy = this.proxyService.acquireRandom();
+    const proxy = await this.proxyService.acquireRandom();
     // this.logger.log(
     //   `[SessionManager] 已分配代理: sessionTag=${proxy.sessionTag}, username=${proxy.username}`,
     // );
@@ -461,10 +464,13 @@ export class SessionManagerService {
       const existingAccount = knownExistingAccount ?? await this.findExistingAppleAccount(normalizedEmail);
       const persistedGuid = guid || existingAccount?.guid || ItunesClientService.generateGuid();
       const persistedGroupId = groupId ?? existingAccount?.groupId ?? 0;
+      // relogin 恢复依赖 apple_account.password, 这里必须保存用户提交的原始明文密码。
+      const plainPassword = String(password || '');
+      const passwordChanged = Boolean(existingAccount && existingAccount.password !== plainPassword);
       const data: Record<string, any> = {
         groupId: persistedGroupId,
         email: normalizedEmail,
-        password,
+        password: plainPassword,
         name: account.name || '',
         dsid: account.directoryServicesId || '',
         storeFront: account.storeFront || '',
@@ -491,6 +497,9 @@ export class SessionManagerService {
       );
 
       await this.accountService.upsert(data);
+      if (passwordChanged) {
+        this.logger.log(`[SessionManager] 已更新现有账号明文密码: ${normalizedEmail}`);
+      }
 
       // [DEBUG] 确认写入成功
       this.logger.log(`[SessionManager][DEBUG] persistAccount 写入成功: ${normalizedEmail}`);

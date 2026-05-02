@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { DatabaseModule } from '../../database/database.module';
+import { AppleInitializationLimiterModule } from '../apple-initialization-limiter/apple-initialization-limiter.module';
 import { DistributedCacheModule } from '../distributed-cache/distributed-cache.module';
 import { ItunesClientModule } from '../itunes-client/itunes-client.module';
 import { UserAccountPoolCoreModule } from '../user-account-pool-core/user-account-pool-core.module';
@@ -14,6 +15,7 @@ import { UserAccountPoolLoginService } from './user-account-pool-login.service';
 @Module({
   imports: [
     DatabaseModule,
+    AppleInitializationLimiterModule,
     DistributedCacheModule,
     ItunesClientModule,
     UserAccountPoolCoreModule,

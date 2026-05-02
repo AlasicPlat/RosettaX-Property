@@ -21,7 +21,7 @@ import { v4 as uuidv4 } from 'uuid';
  * 4. 代理故障时调用 rotateSession() 生成新 tag, 自动获得新出口 IP
  *
  * Decodo 代理规则 (20260414 补充说明):
- * - 基础用户名: spzlof027g, 密码: h9=oY0qXbH5i9Wphef
+ * - 基础用户名和密码从环境变量读取
  * - SOCKS5: gate.decodo.com:7000, protocol: socks5h://
  * - 每次使用基础用户名访问, 服务商随机分配 IP
  * - 修改用户名为 user-spzlof027g-session-{randomTxt}, 该 session 对应的 IP 保留 24 小时
@@ -74,9 +74,11 @@ export class DecodoProxyService implements ProxyProvider {
     this.baseUsername = this.configService.get<string>('DECODO_USERNAME', '');
     this.password = this.configService.get<string>('DECODO_PASSWORD', '');
 
+    const isActiveProvider = this.configService.get<string>('PROXY_PROVIDER', 'iproyal') === 'decodo';
     if (!this.baseUsername || !this.password) {
+      if (!isActiveProvider) return;
       this.logger.error('DECODO_USERNAME 或 DECODO_PASSWORD 未配置, 代理服务将无法正常工作');
-    } else {
+    } else if (isActiveProvider) {
       this.logger.log(
         `✓ Decodo 代理已初始化: ${this.host}:${this.port}, username=${this.baseUsername}`,
       );
@@ -141,7 +143,7 @@ export class DecodoProxyService implements ProxyProvider {
    *
    * @returns Decodo 代理配置
    */
-  acquireRandom(): DecodoProxyConfig {
+  async acquireRandom(): Promise<DecodoProxyConfig> {
     return {
       protocol: 'socks5h',
       host: this.host,
@@ -160,7 +162,7 @@ export class DecodoProxyService implements ProxyProvider {
    * @param sessionTag sticky session 标识
    * @returns 对应的代理配置
    */
-  getConfigForSessionTag(sessionTag: string): DecodoProxyConfig {
+  async getConfigForSessionTag(sessionTag: string): Promise<DecodoProxyConfig> {
     return this.buildConfig(sessionTag);
   }
 
