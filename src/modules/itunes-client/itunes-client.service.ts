@@ -20,7 +20,7 @@ import {
  * 2. login() — MZFinance plist 登录 (含 2FA / 多次重试)
  * 3. redeemInfo() — 验证礼品卡 (GET commerce/redeemInfo)
  * 4. redeemCode() — 兑换礼品卡 (POST commerce/redeemCodeSrv)
- * 5. fetchBalance() — 双链路余额查询 (accountSummary + addFunds/info)
+ * 5. fetchBalance() — Apple Music account/information 余额查询
  *
  * Reference: @docs AppleStoreClient.java (完整协议实现)
  * Reference: @docs ipatool (github.com/majd/ipatool) — MZFinance 认证参照
@@ -30,6 +30,22 @@ import {
 const BAG_URL = 'https://init.itunes.apple.com/bag.xml?ix=6&os=14&locale=zh_CN';
 const DEFAULT_AUTH_URL = 'https://auth.itunes.apple.com/auth/v1/native';
 const DEFAULT_ACCOUNT_SUMMARY_URL = 'https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/accountSummary';
+/** StoreKitUIService User-Agent — Apple Music 账号信息链路沿用 iOS StoreKit 客户端形态. */
+const STOREKIT_USER_AGENT = 'StoreKitUIService/1.0 iOS/14.0 model/iPhone10,2 hwp/t8015 build/18A373 (6; dt:158)';
+/** StoreKit 客户端版本头 — Apple Music 账号信息链路沿用该客户端形态. */
+const STOREKIT_CLIENT_VERSIONS = 'iBooks/7.0; iTunesU/??; GameCenter/??; Podcasts/3.9';
+/** StoreKit 客户端信息头 — Apple 侧会按宿主 App/设备形态做授权判断. */
+const STOREKIT_CLIENT_INFO = '<iPhone10,2> <iPhone OS;14.0;18A373> <com.apple.AppleAccount/1.0 (com.apple.ios.StoreKitUIService/1)>';
+/** Apple Music Web 授权入口 — 讯果查询账号信息链路中出现的只读授权端点. */
+const MUSIC_WEB_AUTH_URL = 'https://auth.music.apple.com/auth/v1/web';
+/** Apple Music 账号信息入口 — 请求 accountSummary/xCardBalance 后可返回 accountBalance. */
+const MUSIC_ACCOUNT_INFORMATION_URL = 'https://buy.music.apple.com/account/information/sections';
+/** Apple Music Web 授权请求体 — 对齐讯果二进制中的固定字符串. */
+const MUSIC_WEB_AUTH_PAYLOAD = { webAuthorizationFlowContext: 'music' };
+/** Apple Music 账号信息请求体 — 对齐讯果二进制中的 sections 列表. */
+const MUSIC_ACCOUNT_INFORMATION_PAYLOAD = {
+  sections: ['accountSummary', 'xCardBalance', 'purchaseHistory'],
+};
 /** Anisette 服务地址 — 通过外部服务获取设备认证 headers */
 const ANISETTE_URL = process.env.ANISETTE_URL || 'http://localhost:6969';
 
@@ -341,9 +357,8 @@ export class ItunesClientService {
             name = `${first} ${last}`.trim();
           }
 
-          // 提取余额信息 — 对标 Java L451-470
+          // 登录响应里的 creditBalance 不是可展示余额; 只有 creditDisplay 才能作为余额使用.
           const creditDisplay = (result.creditDisplay as string) || null;
-          const creditBalance = (result.creditBalance as string) || null;
           const freeSongBalance = (result.freeSongBalance as string) || null;
           const clearToken = (result.clearToken as string) || null;
 
@@ -355,7 +370,7 @@ export class ItunesClientService {
             storeFront,
             pod,
             clearToken,
-            creditBalance: creditDisplay || creditBalance || null,
+            creditBalance: creditDisplay,
             creditDisplay: creditDisplay || null,
             freeSongBalance,
           };
@@ -376,15 +391,15 @@ export class ItunesClientService {
     return { success: false, needs2FA: false, errorMessage: '登录失败: 超过最大重试次数 (4次)', sessionCookies };
   }
 
-  // ==================== Phase 2: 余额查询 (双链路 fallback) ====================
+  // ==================== Phase 2: 余额查询 (Apple Music account/information) ====================
 
   /**
-   * @description 获取账户余额 — 双链路策略, 对标 Java AppleStoreClient.fetchBalance().
+   * @description 获取账户余额 — 仅使用已验证可用的 Apple Music account/information 链路.
    *
-   * 链路 A (主要): accountSummary — 用 X-Token header 认证, 响应为 plist, 含 creditDisplay.
-   * 链路 B (备选): addFunds/info — 用 X-Token header 认证, 响应为 JSON, 含 current-balance.
-   *
-   * Reference: AppleStoreClient.java L533-555
+   * 之前的 accountSummary/addFunds/paymentInfos 对当前登录态不稳定:
+   * accountSummary 常返回 HTML, addFunds 缺 mt-tkn, paymentInfos 不返回 totalCredit。
+   * 讯果实际成功链路是 Apple Music account/information/sections 中的 accountBalance,
+   * 因此余额展示入口只保留该链路, 避免错误 fallback 拉长请求并污染日志。
    *
    * @param account 账号数据
    * @param sessionCookies session cookies
@@ -403,38 +418,39 @@ export class ItunesClientService {
       return null;
     }
 
-    // 链路 A: accountSummary
-    const balanceFromSummary = await this.fetchBalanceViaAccountSummary(account, sessionCookies, guid, proxy);
-    if (balanceFromSummary) {
-      this.logger.log(`  ✓ 余额已通过 accountSummary 获取: ${balanceFromSummary}`);
-      return balanceFromSummary;
+    this.logger.log('>>> 查询余额: Apple Music account/information');
+    const balanceFromMusicAccount = await this.fetchBalanceViaAppleMusicAccountInformation(
+      account,
+      sessionCookies,
+      guid,
+      proxy,
+    );
+    if (balanceFromMusicAccount) {
+      return balanceFromMusicAccount;
     }
 
-    // 链路 B: addFunds/info
-    this.logger.log('  accountSummary 失败, 尝试 addFunds/info (X-Token)...');
-    const balanceFromAddFunds = await this.fetchBalanceViaAddFunds(account, sessionCookies, guid, proxy);
-    if (balanceFromAddFunds) {
-      return balanceFromAddFunds;
-    }
-
-    this.logger.warn('  ✘ 两条链路均未获取到余额');
+    this.logger.warn('  ✘ Apple Music account/information 未获取到余额');
     return null;
   }
 
   /**
-   * @description 链路 A: 通过 accountSummary 获取余额 — 对标 Java fetchBalanceViaAccountSummary().
+   * @description 通过 accountSummary 刷新真实 session cookie.
    *
-   * 使用 X-Token header 认证 (passwordToken), 不需要 iOS session cookies.
-   * Apple 在响应中同时返回 plist body (含 creditDisplay) 和 Set-Cookie (真实 session cookies).
+   * 该方法仅供 ensureSessionCookies() 在兑换前建立 mz_at_ssl 使用, 不参与余额展示,
+   * 也不会解析或写入 creditDisplay。余额查询统一走 Apple Music account/information。
    *
-   * Reference: AppleStoreClient.java L562-693
+   * @param account 账号数据
+   * @param sessionCookies 当前 session cookie 集合, 响应 Set-Cookie 会被追加进去
+   * @param guid 设备指纹
+   * @param proxy 代理实例
+   * @sideEffects 可能更新 sessionCookies 中的 mz_at_ssl 等 Cookie
    */
-  private async fetchBalanceViaAccountSummary(
+  private async refreshSessionCookiesViaAccountSummary(
     account: SessionAccountData,
     sessionCookies: Map<string, string>,
     guid: string,
     proxy: ProxyConfig | null,
-  ): Promise<string | null> {
+  ): Promise<void> {
     try {
       const dsid = account.directoryServicesId;
       const token = account.passwordToken;
@@ -442,7 +458,7 @@ export class ItunesClientService {
       const host = pod ? `p${pod}-buy.itunes.apple.com` : 'buy.itunes.apple.com';
       const url = `https://${host}/WebObjects/MZFinance.woa/wa/accountSummary?guid=${guid}`;
 
-      this.logger.log(`>>> 查询余额 (accountSummary): ${url}`);
+      this.logger.log(`>>> 刷新 session cookie (accountSummary): ${url}`);
 
       const anisetteHeaders = await this.getAnisetteHeaders();
       const storeFront = account.storeFront || '143465-19,29';
@@ -481,145 +497,274 @@ export class ItunesClientService {
 
       if (response.status !== 200) {
         this.logger.warn(`  ✘ accountSummary HTTP ${response.status}`);
-        return null;
+        return;
       }
 
-      return this.parseBalanceFromAccountSummary(body, account);
+      return;
     } catch (error: any) {
       this.logger.error(`  ✘ accountSummary 异常: ${error.message}`);
-      return null;
+      if (ItunesClientService.isProxyTransportException(error)) {
+        throw error;
+      }
+      return;
     }
   }
 
   /**
-   * @description 从 accountSummary 响应体中解析余额 — plist + regex 双策略.
+   * @description 通过 Apple Music 账号信息接口读取 accountBalance.
    *
-   * Reference: AppleStoreClient.java L635-693
-   */
-  private parseBalanceFromAccountSummary(body: string, account: SessionAccountData): string | null {
-    // 策略 1: 解析 plist
-    try {
-      const parsed = plist.parse(body) as Record<string, any>;
-      const creditDisplay = parsed.creditDisplay as string | undefined;
-      if (creditDisplay) {
-        this.logger.log(`  ✓ accountSummary plist 余额 (creditDisplay): ${creditDisplay}`);
-        account.creditDisplay = creditDisplay;
-        account.creditBalance = creditDisplay;
-        return creditDisplay;
-      }
-      const creditBalance = parsed.creditBalance as string | undefined;
-      if (creditBalance) {
-        this.logger.log(`  ✓ accountSummary plist 余额 (creditBalance): ${creditBalance}`);
-        account.creditBalance = creditBalance;
-        if (!account.creditDisplay) account.creditDisplay = creditBalance;
-        return creditBalance;
-      }
-    } catch {
-      this.logger.log('  plist 解析失败, 尝试文本匹配...');
-    }
-
-    // 策略 2: 正则匹配 — 对标 Java L669-688
-    const patterns = [
-      /creditDisplay["']?\s*[:=]\s*["']([^"']+)["']/,
-      /¥[\d,]+\.\d{2}/,
-      /\$[\d,]+\.\d{2}/,
-      /current.?balance["']?\s*[:=]\s*["']([^"']+)["']/i,
-    ];
-    for (const p of patterns) {
-      const m = body.match(p);
-      if (m) {
-        const balance = m[1] || m[0];
-        this.logger.log(`  ✓ accountSummary 文本匹配余额: ${balance}`);
-        account.creditDisplay = balance;
-        account.creditBalance = balance;
-        return balance;
-      }
-    }
-
-    this.logger.warn(`  ✘ accountSummary 无法解析余额`);
-    return null;
-  }
-
-  /**
-   * @description 链路 B: 通过 addFunds/info 获取余额 — 对标 Java fetchBalanceViaAddFunds().
+   * 讯果二进制中保留了 `auth.music.apple.com/auth/v1/web` 与
+   * `buy.music.apple.com/account/information/sections` 两个端点, 请求
+   * accountSummary/xCardBalance/purchaseHistory sections 后解析 `accountBalance`.
+   * 该链路不依赖 addFunds 所需的 mt-tkn, 是当前余额展示唯一保留的查询路径。
    *
-   * Reference: AppleStoreClient.java L699-783
+   * @param account 账号数据, 会在解析到余额时更新 creditDisplay/creditBalance
+   * @param sessionCookies 当前 session cookie 集合, 响应 Set-Cookie 会被追加进去
+   * @param guid 设备指纹
+   * @param proxy 代理实例
+   * @returns 格式化余额字符串, 失败返回 null
    */
-  private async fetchBalanceViaAddFunds(
+  private async fetchBalanceViaAppleMusicAccountInformation(
     account: SessionAccountData,
     sessionCookies: Map<string, string>,
     guid: string,
     proxy: ProxyConfig | null,
   ): Promise<string | null> {
     try {
-      const pod = account.pod;
-      const host = pod ? `p${pod}-buy.itunes.apple.com` : 'buy.itunes.apple.com';
-      const url = `https://${host}/commerce/addFunds/info?guid=${guid}&guid=${guid}`;
-
-      this.logger.log(`>>> 查询余额 (addFunds/info): ${url}`);
-
-      const anisetteHeaders = await this.getAnisetteHeaders();
-      const dsid = account.directoryServicesId;
-      const token = account.passwordToken;
-      const storeFront = account.storeFront || '143465-19,29';
-      const clientTime = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-
-      const headers: Record<string, string> = {
-        Connection: 'keep-alive',
-        'X-Apple-Store-Front': storeFront,
-        'X-Apple-Partner': 'origin.0',
-        'X-Apple-Client-Application': 'Software',
-        'X-Apple-Connection-Type': 'WiFi',
-        'X-Apple-Client-Versions': 'GameCenter/2.0',
-        'X-Token-T': 'M',
-        'X-Apple-Tz': '28800',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0',
-        Accept: '*/*',
-        'Content-Type': 'application/x-apple-plist; Charset=UTF-8',
-        'User-Agent': 'iTunes/12.12 (Macintosh; OS X 10.10) AppleWebKit/600.1.3.41',
-        'X-Apple-Software-Guid': guid,
-        'X-Token': token,
-        'X-Dsid': dsid,
-        'iCloud-DSID': dsid,
-        'X-Apple-I-Client-Time': clientTime,
-        Referer: `https://${host}/commerce/addFunds/info`,
-        ...anisetteHeaders,
-      };
-
-      const response = await this.httpProxyService.requestWithProxy(
-        { method: 'GET', url, headers, validateStatus: () => true },
+      const authHeaders = await this.buildAppleMusicAccountHeaders(account, sessionCookies, guid);
+      const authResponse = await this.httpProxyService.requestWithProxy(
+        {
+          method: 'POST',
+          url: MUSIC_WEB_AUTH_URL,
+          data: JSON.stringify(MUSIC_WEB_AUTH_PAYLOAD),
+          headers: authHeaders,
+          validateStatus: () => true,
+          responseType: 'text',
+        },
         proxy,
       );
+      const authBody = ItunesClientService.normalizeResponseBody(authResponse.data);
+      this.captureSetCookies(authResponse.headers?.['set-cookie'], sessionCookies);
+      this.logger.log(`  Apple Music auth 响应: HTTP ${authResponse.status} (${authBody.length} bytes)`);
 
-      const body = typeof response.data === 'string' ? response.data : String(response.data);
-      this.logger.log(`  addFunds/info 响应: HTTP ${response.status} (${body.length} bytes)`);
+      const musicUserToken = this.extractAppleMusicUserToken(authBody);
+      if (authResponse.status !== 200 && authResponse.status !== 204) {
+        this.logger.warn(`  ✘ Apple Music auth HTTP ${authResponse.status}: ${authBody.substring(0, 300)}`);
+      }
 
-      this.captureSetCookies(response.headers?.['set-cookie'], sessionCookies);
+      const infoHeaders = await this.buildAppleMusicAccountHeaders(account, sessionCookies, guid);
+      if (musicUserToken) {
+        infoHeaders['Music-User-Token'] = musicUserToken;
+      }
 
-      if (response.status !== 200) {
-        this.logger.warn(`  ✘ addFunds/info HTTP ${response.status}`);
+      const infoResponse = await this.httpProxyService.requestWithProxy(
+        {
+          method: 'POST',
+          url: MUSIC_ACCOUNT_INFORMATION_URL,
+          data: JSON.stringify(MUSIC_ACCOUNT_INFORMATION_PAYLOAD),
+          headers: infoHeaders,
+          validateStatus: () => true,
+          responseType: 'text',
+        },
+        proxy,
+      );
+      const infoBody = ItunesClientService.normalizeResponseBody(infoResponse.data);
+      this.captureSetCookies(infoResponse.headers?.['set-cookie'], sessionCookies);
+      this.logger.log(`  Apple Music account/information 响应: HTTP ${infoResponse.status} (${infoBody.length} bytes)`);
+
+      if (infoResponse.status !== 200) {
+        this.logger.warn(`  ✘ Apple Music account/information HTTP ${infoResponse.status}: ${infoBody.substring(0, 300)}`);
         return null;
       }
 
-      // 解析 JSON — 对标 Java L758-777
-      const json = JSON.parse(body);
-      const status = json.status ?? -1;
-      if (status !== 0) {
-        this.logger.warn(`  ✘ addFunds/info status=${status}`);
-        return null;
-      }
-
-      const currentBalance = json.data?.attributes?.info?.['current-balance'] ?? null;
-      if (currentBalance) {
-        this.logger.log(`  ✓ addFunds/info 余额: ${currentBalance}`);
-        account.creditDisplay = currentBalance;
-        account.creditBalance = currentBalance;
-      }
-      return currentBalance;
+      return this.parseAppleMusicAccountBalanceResponse(infoBody, account);
     } catch (error: any) {
-      this.logger.error(`  ✘ addFunds/info 异常: ${error.message}`);
+      this.logger.error(`  ✘ Apple Music account/information 异常: ${error.message}`);
+      if (ItunesClientService.isProxyTransportException(error)) {
+        throw error;
+      }
       return null;
     }
+  }
+
+  /**
+   * @description 构造 Apple Music 账号信息链路的认证 headers.
+   * @param account 账号数据, 提供 DSID/storeFront/passwordToken
+   * @param sessionCookies 当前 session cookie 集合
+   * @param guid 设备指纹
+   * @returns Apple Music Web 授权与账号信息接口可复用的 headers
+   */
+  private async buildAppleMusicAccountHeaders(
+    account: SessionAccountData,
+    sessionCookies: Map<string, string>,
+    guid: string,
+  ): Promise<Record<string, string>> {
+    const dsid = account.directoryServicesId;
+    const anisetteHeaders = await this.getAnisetteHeaders();
+    const clientTime = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+    return {
+      Connection: 'keep-alive',
+      Cookie: ItunesClientService.buildCookieString(dsid, account.pod, sessionCookies),
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'zh-cn',
+      'User-Agent': STOREKIT_USER_AGENT,
+      Origin: 'https://music.apple.com',
+      Referer: 'https://music.apple.com/',
+      'X-Apple-Store-Front': account.storeFront || '143465-19,29',
+      'X-Apple-Client-Versions': STOREKIT_CLIENT_VERSIONS,
+      'X-Apple-Connection-Type': 'WiFi',
+      'X-Apple-I-TimeZone': 'GMT+8',
+      'X-Apple-I-Client-Time': clientTime,
+      'X-Apple-I-Locale': 'zh_CN@currency=CNY',
+      'X-Apple-I-MD-RINFO': '67437824',
+      'X-MMe-Client-Info': STOREKIT_CLIENT_INFO,
+      'X-Dsid': dsid,
+      'iCloud-DSID': dsid,
+      'X-Token': account.passwordToken,
+      'X-Token-T': 'M',
+      'X-Apple-Software-Guid': guid,
+      ...anisetteHeaders,
+    };
+  }
+
+  /**
+   * @description 从 Apple Music auth 响应中提取 music user token.
+   * @param body auth.music.apple.com/auth/v1/web 响应体
+   * @returns 可选 Music-User-Token, 未返回时为 null
+   */
+  private extractAppleMusicUserToken(body: string): string | null {
+    const trimmedBody = body.trim();
+    if (!trimmedBody.startsWith('{')) {
+      return null;
+    }
+
+    try {
+      const json = JSON.parse(trimmedBody);
+      const token =
+        json.musicUserToken ??
+        json['music-user-token'] ??
+        json.mediaUserToken ??
+        json.data?.musicUserToken ??
+        null;
+      return typeof token === 'string' && token.length > 0 ? token : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * @description 解析 Apple Music account/information 响应中的 accountBalance.
+   * @param body account/information/sections 原始响应体
+   * @param account 账号数据, 解析成功时会写入 creditDisplay/creditBalance
+   * @returns 格式化余额字符串, 解析失败返回 null
+   */
+  private parseAppleMusicAccountBalanceResponse(body: string, account: SessionAccountData): string | null {
+    const trimmedBody = body.trim();
+    if (!trimmedBody.startsWith('{')) {
+      this.logger.warn(`  ✘ Apple Music account/information 非 JSON 响应: ${trimmedBody.substring(0, 300)}`);
+      return null;
+    }
+
+    try {
+      const json = JSON.parse(trimmedBody);
+      const balance =
+        ItunesClientService.findNestedStringValue(json, 'accountBalance') ??
+        ItunesClientService.findNestedStringValue(json, 'creditDisplay') ??
+        ItunesClientService.findNestedStringValue(json, 'xCardBalance') ??
+        null;
+
+      if (balance !== null && balance !== undefined && String(balance).length > 0) {
+        const displayBalance = String(balance);
+        this.logger.log(`  ✓ Apple Music account/information 余额: ${displayBalance}`);
+        account.creditDisplay = displayBalance;
+        account.creditBalance = displayBalance;
+        return displayBalance;
+      }
+
+      const match = trimmedBody.match(/"accountBalance"\s*:\s*"([^"]+)"/);
+      if (match?.[1]) {
+        const displayBalance = match[1];
+        this.logger.log(`  ✓ Apple Music account/information 文本余额: ${displayBalance}`);
+        account.creditDisplay = displayBalance;
+        account.creditBalance = displayBalance;
+        return displayBalance;
+      }
+
+      this.logger.warn(`  ✘ Apple Music account/information 未返回 accountBalance, body: ${trimmedBody.substring(0, 300)}`);
+      return null;
+    } catch (error: any) {
+      this.logger.warn(`  ✘ Apple Music account/information JSON 解析失败: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * @description 将 axios 响应体统一转换成字符串, 保留 JSON 对象的可解析结构.
+   * @param data axios response.data
+   * @returns 字符串响应体
+   */
+  private static normalizeResponseBody(data: any): string {
+    if (typeof data === 'string') return data;
+    if (Buffer.isBuffer(data)) return data.toString('utf-8');
+    if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data)).toString('utf-8');
+    if (data instanceof Uint8Array) return Buffer.from(data).toString('utf-8');
+    if (data === undefined || data === null) return '';
+    return JSON.stringify(data);
+  }
+
+  /**
+   * @description 深度查找 JSON 对象中第一个匹配 key 的字符串/数字值.
+   * @param value 待搜索的 JSON 值
+   * @param targetKey 目标 key
+   * @returns 找到的字符串值, 未找到返回 null
+   */
+  private static findNestedStringValue(value: any, targetKey: string): string | null {
+    if (value === null || value === undefined) return null;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = ItunesClientService.findNestedStringValue(item, targetKey);
+        if (found !== null) return found;
+      }
+      return null;
+    }
+    if (typeof value !== 'object') return null;
+
+    for (const [key, nestedValue] of Object.entries(value)) {
+      if (
+        key === targetKey &&
+        (typeof nestedValue === 'string' || typeof nestedValue === 'number')
+      ) {
+        return String(nestedValue);
+      }
+      const found = ItunesClientService.findNestedStringValue(nestedValue, targetKey);
+      if (found !== null) return found;
+    }
+
+    return null;
+  }
+
+  /**
+   * @description 判断异常是否来自代理传输层, 用于让上层立即轮换 sticky 代理.
+   * @param error 捕获到的 axios/agent 异常
+   * @returns true 表示应中断当前余额链路并切换代理重试
+   */
+  private static isProxyTransportException(error: any): boolean {
+    const message = String(error?.message || '').toLowerCase();
+    const code = String(error?.code || '');
+    return (
+      message.includes('proxy connection timed out') ||
+      message.includes('socksclient') ||
+      message.includes('socks5') ||
+      message.includes('http connect') ||
+      message.includes('socket hang up') ||
+      message.includes('connection refused') ||
+      message.includes('host unreachable') ||
+      message.includes('network unreachable') ||
+      message.includes('timed out') ||
+      ['ECONNABORTED', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH'].includes(code)
+    );
   }
 
   // ==================== Session Cookie 建立 ====================
@@ -634,7 +779,7 @@ export class ItunesClientService {
    * Java 流程:
    *   1. login → Set-Cookie 中 mz_at_ssl 值 = passwordToken (不是真实 session cookie)
    *   2. ensureSessionCookies() → 检测到 mz_at_ssl == passwordToken
-   *   3. fetchBalance() → accountSummary (X-Token) → Set-Cookie 返回真实 mz_at_ssl (~48 bytes)
+   *   3. refreshSessionCookiesViaAccountSummary() → Set-Cookie 返回真实 mz_at_ssl (~48 bytes)
    *   4. redeemInfo (Cookie 认证) → 使用真实 mz_at_ssl → ✓ 200
    *
    * Reference: AppleStoreClient.java L507-514 (ensureSessionCookies), L822-883 (establishSessionCookies)
@@ -685,14 +830,9 @@ export class ItunesClientService {
     //   `需要通过 accountSummary 建立真实 session cookies`,
     // );
 
-    // 通过 accountSummary 获取真实 session cookies — 复用已有的 fetchBalanceViaAccountSummary
-    // accountSummary 使用 X-Token 认证, 响应 Set-Cookie 中包含真实的 mz_at_ssl (~48 bytes)
-    const balance = await this.fetchBalanceViaAccountSummary(account, sessionCookies, guid, proxy);
-    // if (balance) {
-    //   this.logger.log(`  ✓ ensureSessionCookies 完成, 同时获取到余额: ${balance}`);
-    // } else {
-    //   this.logger.log(`  ✓ ensureSessionCookies 完成 (余额未解析, 但 cookies 应已更新)`);
-    // }
+    // accountSummary 不再作为余额查询链路使用; 这里仅用于兑换前刷新真实 mz_at_ssl cookie。
+    // Apple 在该接口的 Set-Cookie 中可能下发真实 session cookie (~48 bytes)。
+    await this.refreshSessionCookiesViaAccountSummary(account, sessionCookies, guid, proxy);
 
     // 验证 cookies 是否已更新为真实 session cookie
     let updatedMzAtSsl: string | null = null;

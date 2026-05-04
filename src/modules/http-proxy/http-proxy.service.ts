@@ -583,15 +583,29 @@ export class HttpProxyService {
 
   /**
    * @description 是否为代理传输层错误 (而非目标站业务错误).
+   *
+   * 代理库部分超时只写入 message, 不一定填充 Node error.code。
+   * 这里按 message 补齐识别, 避免在同一个坏 sticky 出口上重复等待。
    */
   private isProxyTransportError(error: any): boolean {
     const message = String(error?.message || '');
     // SOCKS5 层面的错误 (认证失败、连接拒绝等)
-    if (message.includes('Socks5') || message.startsWith('SOCKS5') || message.startsWith('HTTP CONNECT')) {
+    const normalizedMessage = message.toLowerCase();
+    if (
+      message.includes('Socks5') ||
+      message.startsWith('SOCKS5') ||
+      message.startsWith('HTTP CONNECT') ||
+      normalizedMessage.includes('proxy connection timed out') ||
+      normalizedMessage.includes('socket hang up') ||
+      normalizedMessage.includes('connection refused') ||
+      normalizedMessage.includes('host unreachable') ||
+      normalizedMessage.includes('network unreachable') ||
+      normalizedMessage.includes('timed out')
+    ) {
       return true;
     }
 
     const code = String(error?.code || '');
-    return ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH'].includes(code);
+    return ['ECONNABORTED', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH'].includes(code);
   }
 }

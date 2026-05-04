@@ -36,6 +36,8 @@ function parsePositiveIntEnv(key: string, fallback: number): number {
 
 /** 单 Property worker 内账号登录并发数. */
 const LOGIN_CONCURRENCY = parsePositiveIntEnv('ROSETTAX_PROPERTY_LOGIN_CONCURRENCY', 5);
+/** GiftCardExchanger 兑换账号余额刷新并发数. */
+const EXCHANGE_BALANCE_REFRESH_CONCURRENCY = parsePositiveIntEnv('ROSETTAX_PROPERTY_EXCHANGE_BALANCE_CONCURRENCY', 3);
 
 /**
  * @description GiftCardExchanger 兑换账号登录结果.
@@ -179,6 +181,7 @@ export class UserAccountPoolLoginService {
    *
    * 该流程只建立 Apple 兑换 session 并读取账号地区/余额, 不写入用户查询账号池,
    * 避免兑换账号被余额查询账号池误用。
+   * 余额刷新采用第二阶段小并发执行, 避免单个 Apple/代理慢请求阻塞整批任务。
    *
    * @param accounts 兑换账号列表
    * @param groupId 当前用户组 ID
@@ -190,14 +193,73 @@ export class UserAccountPoolLoginService {
     groupId: number | null,
     options: { jobId?: string } = {},
   ): Promise<ExchangeAccountLoginResult[]> {
-    const results: ExchangeAccountLoginResult[] = [];
+    const results = new Array<ExchangeAccountLoginResult>(accounts.length);
+    const balanceRefreshTasks: Array<{
+      resultIndex: number;
+      sessionId: string;
+      email: string;
+      loginBalance: string | null;
+      startedAt: number;
+    }> = [];
 
-    for (const account of accounts) {
-      const result = await this.loginSingleExchangeAccount(account.email, account.password, groupId);
-      results.push(result);
+    for (let index = 0; index < accounts.length; index++) {
+      const account = accounts[index];
+      const result = await this.loginSingleExchangeAccount(account.email, account.password, groupId, {
+        refreshBalance: false,
+      });
+      results[index] = result;
 
-      if (options.jobId) {
-        await this.recordExchangeLoginJobResult(options.jobId, results, result);
+      if (result.status === 'success' && result.sessionId) {
+        balanceRefreshTasks.push({
+          resultIndex: index,
+          sessionId: result.sessionId,
+          email: result.email,
+          loginBalance: result.balance || null,
+          startedAt: Date.now(),
+        });
+      }
+    }
+
+    if (balanceRefreshTasks.length > 0) {
+      this.logger.log(
+        `[ExchangeLogin] 开始并发刷新兑换账号余额: ` +
+        `total=${balanceRefreshTasks.length}, concurrency=${EXCHANGE_BALANCE_REFRESH_CONCURRENCY}`,
+      );
+
+      await this.mapWithConcurrencyLimit(
+        balanceRefreshTasks,
+        EXCHANGE_BALANCE_REFRESH_CONCURRENCY,
+        async (task) => {
+          const result = results[task.resultIndex];
+          if (!result || result.status !== 'success') return;
+
+          try {
+            const balance = await this.refreshExchangeAccountBalance(task.sessionId);
+            if (balance) {
+              result.balance = balance;
+              this.logger.log(
+                `[ExchangeLogin] 余额刷新成功: email=${task.email}, ` +
+                `${task.loginBalance || 'N/A'} → ${balance}, elapsed=${Date.now() - task.startedAt}ms`,
+              );
+            } else {
+              this.logger.warn(
+                `[ExchangeLogin] 余额刷新返回空值: email=${task.email}, ` +
+                `保留登录余额=${result.balance || 'N/A'}, elapsed=${Date.now() - task.startedAt}ms`,
+              );
+            }
+          } catch (error: any) {
+            result.balanceError = error.message || '余额刷新失败';
+            this.logger.warn(`[ExchangeLogin] 余额刷新失败: ${task.email} — ${result.balanceError}`);
+          }
+        },
+      );
+    }
+
+    if (options.jobId) {
+      const completedResults: ExchangeAccountLoginResult[] = [];
+      for (const result of results) {
+        completedResults.push(result);
+        await this.recordExchangeLoginJobResult(options.jobId, completedResults, result);
       }
     }
 
@@ -530,12 +592,14 @@ export class UserAccountPoolLoginService {
    * @param email Apple ID 邮箱
    * @param password Apple ID 密码
    * @param groupId 当前用户组 ID
+   * @param options refreshBalance=false 时只登录并返回 session, 余额由批量阶段并发刷新
    * @returns 兑换账号登录结果
    */
   private async loginSingleExchangeAccount(
     email: string,
     password: string,
     groupId: number | null,
+    options: { refreshBalance?: boolean } = {},
   ): Promise<ExchangeAccountLoginResult> {
     const emailKey = email.toLowerCase();
     const startedAt = Date.now();
@@ -550,15 +614,17 @@ export class UserAccountPoolLoginService {
       if (loginResult.status === 'success' && loginResult.sessionId) {
         const storeFront = loginResult.account?.storeFront || '';
         const region = this.identityService.parseRegionFromStoreFront(storeFront);
-        let balance = loginResult.account?.creditDisplay || loginResult.account?.creditBalance || null;
+        let balance = loginResult.account?.creditDisplay || null;
         let balanceError: string | undefined;
 
-        try {
-          const refreshedBalance = await this.refreshExchangeAccountBalance(loginResult.sessionId);
-          if (refreshedBalance) balance = refreshedBalance;
-        } catch (error: any) {
-          balanceError = error.message || '余额刷新失败';
-          this.logger.warn(`[ExchangeLogin] 余额刷新失败: ${emailKey} — ${balanceError}`);
+        if (options.refreshBalance !== false) {
+          try {
+            const refreshedBalance = await this.refreshExchangeAccountBalance(loginResult.sessionId);
+            if (refreshedBalance) balance = refreshedBalance;
+          } catch (error: any) {
+            balanceError = error.message || '余额刷新失败';
+            this.logger.warn(`[ExchangeLogin] 余额刷新失败: ${emailKey} — ${balanceError}`);
+          }
         }
 
         return {
@@ -606,7 +672,8 @@ export class UserAccountPoolLoginService {
   /**
    * @description 刷新兑换账号余额.
    *
-   * 登录响应已有 creditDisplay 时直接复用; 否则用 iTunes 双链路余额接口补齐。
+   * 登录响应已有 creditDisplay 时直接复用; 否则用 Apple Music account/information 补齐余额。
+   * 首次查询失败时会刷新式 re-login 并重试一次, 保证 Redis 中 session/cookies 同步更新。
    * 该方法只服务兑换账号登录结果展示, 失败时不阻断账号登录成功。
    *
    * @param sessionId Apple managed session ID
@@ -623,15 +690,16 @@ export class UserAccountPoolLoginService {
 
     const proxy = await this.sessionManager.getSessionProxy(session);
     try {
-      return await this.itunesClient.fetchBalance(
+      const balance = await this.itunesClient.fetchBalance(
         account,
         session.sessionCookies,
         session.guid,
         proxy,
       );
+      if (balance) return balance;
     } catch (error: any) {
       const message = error.message || '';
-      if (!message.includes('Connection refused') && !message.includes('Host unreachable')) {
+      if (!this.isRecoverableProxyError(message)) {
         throw error;
       }
 
@@ -644,6 +712,27 @@ export class UserAccountPoolLoginService {
         await this.sessionManager.getSessionProxy(session),
       );
     }
+
+    const reloginResult = await this.sessionManager.reloginSession(sessionId);
+    if (reloginResult.status !== 'success') {
+      this.logger.warn(
+        `[ExchangeLogin] re-login 未成功: sessionId=${sessionId}, ` +
+        `status=${reloginResult.status}, error=${reloginResult.errorMessage || 'none'}`,
+      );
+      return null;
+    }
+
+    const refreshedSession = await this.sessionManager.getLoggedInSession(sessionId);
+    if (refreshedSession.account?.creditDisplay) {
+      return refreshedSession.account.creditDisplay;
+    }
+
+    return this.itunesClient.fetchBalance(
+      refreshedSession.account!,
+      refreshedSession.sessionCookies,
+      refreshedSession.guid,
+      await this.sessionManager.getSessionProxy(refreshedSession),
+    );
   }
 
   /**
@@ -920,6 +1009,36 @@ export class UserAccountPoolLoginService {
       sessionId: loginResult.sessionId,
       errorMessage: loginResult.errorMessage,
     };
+  }
+
+  /**
+   * @description 判断异常是否属于可恢复的代理传输错误.
+   *
+   * 供应商代理超时有时只体现在 message 中, 不会带标准 error.code。
+   * 兑换账号余额刷新遇到这类错误必须先换 sticky session, 避免在坏出口上耗尽网关超时。
+   *
+   * @param message 异常消息.
+   * @returns true 表示应切换代理后重试.
+   */
+  private isRecoverableProxyError(message: string): boolean {
+    const normalizedMessage = message.toLowerCase();
+    return (
+      normalizedMessage.includes('proxy connection timed out') ||
+      normalizedMessage.includes('socksclient') ||
+      normalizedMessage.includes('socks5') ||
+      normalizedMessage.includes('http connect') ||
+      normalizedMessage.includes('connection refused') ||
+      normalizedMessage.includes('host unreachable') ||
+      normalizedMessage.includes('network unreachable') ||
+      normalizedMessage.includes('socket hang up') ||
+      normalizedMessage.includes('timed out') ||
+      message.includes('ECONNABORTED') ||
+      message.includes('ECONNRESET') ||
+      message.includes('ECONNREFUSED') ||
+      message.includes('ETIMEDOUT') ||
+      message.includes('EHOSTUNREACH') ||
+      message.includes('ENETUNREACH')
+    );
   }
 
 }

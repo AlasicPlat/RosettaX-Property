@@ -295,6 +295,62 @@ export class SessionManagerService {
     return { status: 'failed', errorMessage: result.errorMessage };
   }
 
+  /**
+   * @description 对已登录会话执行刷新式 re-login, 并把新 account/cookies 持久化回 Redis.
+   *
+   * GiftCardExchanger 的异步登录任务由 Property worker 执行; 如果这里只是临时调用
+   * ItunesClientService.login(), 主服务轮询 job 或后续兑换仍会读到 Redis 里的旧 cookie。
+   * 因此 re-login 必须保持原 sessionId 并刷新持久化 session。
+   *
+   * @param sessionId 需要刷新授权的 managed session ID
+   * @returns 登录刷新结果, sessionId 保持不变
+   * @sideEffects 更新 Redis session 元数据、cookie hash 和 apple_account 持久化记录
+   */
+  async reloginSession(sessionId: string): Promise<LoginResultDto> {
+    const session = await this.getLoggedInSession(sessionId);
+    if (!session.password) {
+      return { status: 'failed', sessionId, errorMessage: '会话缺少密码, 无法重新登录' };
+    }
+
+    const proxy = await this.getSessionProxy(session);
+    const result = await this.itunesClient.login(session.email, session.password, session.guid, proxy);
+
+    if (result.success && result.account) {
+      session.account = result.account;
+      session.sessionCookies = result.sessionCookies;
+      session.status = 'logged_in';
+      session.loginTime = Date.now();
+
+      await this.persistAccount(
+        result.account,
+        session.password,
+        session.guid,
+        session.region || undefined,
+        session.groupId ?? null,
+      );
+      await this.persistSession(sessionId, session);
+
+      return {
+        status: 'success',
+        sessionId,
+        account: this.sanitizeAccount(result.account),
+      };
+    }
+
+    if (result.needs2FA) {
+      session.status = 'awaiting_2fa';
+      session.sessionCookies = result.sessionCookies;
+      await this.persistSession(sessionId, session);
+      return { status: 'needs_2fa', sessionId, errorMessage: '需要输入 2FA 验证码' };
+    }
+
+    return {
+      status: 'failed',
+      sessionId,
+      errorMessage: result.errorMessage || '重新登录失败',
+    };
+  }
+
   // ==================== 会话查询 ====================
 
   /**
@@ -552,9 +608,10 @@ export class SessionManagerService {
       }
       pipeline.expire(metaKey, SESSION_TTL_SECONDS);
 
-      // 保存 session cookies (独立 hash key)
+      // 保存 session cookies (独立 hash key). 先清空旧 hash, 避免 re-login 后残留过期 cookie.
+      const cookieKey = CACHE_KEYS.MANAGED_SESSION_COOKIES.build(sessionId);
+      pipeline.del(cookieKey);
       if (session.sessionCookies.size > 0) {
-        const cookieKey = CACHE_KEYS.MANAGED_SESSION_COOKIES.build(sessionId);
         for (const [name, value] of session.sessionCookies) {
           pipeline.hset(cookieKey, name, value);
         }
