@@ -82,7 +82,7 @@ export class AccountSessionCacheService {
    * @param cacheKey 缓存 key, 格式为 accountIdentity:regionPath
    * @param context 已初始化的查询上下文
    * @param cookies 会话 Cookie 容器
-   * @sideEffects 写入 Redis session、地区预热索引和账号地区反向索引
+   * @sideEffects 写入 Redis session、重置使用计数、维护地区预热索引和账号地区反向索引
    */
   async saveSession(
     cacheKey: string,
@@ -93,6 +93,7 @@ export class AccountSessionCacheService {
     const ttlDecision = this.resolveSessionCacheTtl(cookies);
     const serialized = this.serializeSession(context, cookies, email, ttlDecision);
     await this.cacheService.saveSession(cacheKey, serialized, ttlDecision.ttlMs);
+    await this.cacheService.clearUsageStats(cacheKey);
 
     const { accountIdentity, regionPath } = this.parseCacheKey(cacheKey);
     if (regionPath) {
@@ -113,6 +114,7 @@ export class AccountSessionCacheService {
    */
   async evictSession(cacheKey: string): Promise<void> {
     await this.cacheService.evictSession(cacheKey);
+    await this.cacheService.clearUsageStats(cacheKey);
 
     const { accountIdentity, regionPath } = this.parseCacheKey(cacheKey);
     if (regionPath && accountIdentity) {

@@ -341,6 +341,23 @@ export class DistributedCacheService {
     }
   }
 
+  /**
+   * @description 清理指定查询 session 的使用统计.
+   *
+   * Property 负责重建查询上下文; 成功重建后必须清空旧计数, 避免 RosettaX
+   * 看到新 session 却沿用上一轮 usageCount 并立即再次触发轮换。
+   *
+   * @param cacheKey 缓存 key
+   * @sideEffects 删除 Redis 使用统计 Hash
+   */
+  async clearUsageStats(cacheKey: string): Promise<void> {
+    try {
+      await this.redisService.getClient().del(CACHE_KEYS.USAGE.build(cacheKey));
+    } catch (error: any) {
+      this.logger.warn(`[cache] 使用统计清理失败: key=${cacheKey} — ${error.message}`);
+    }
+  }
+
   // ==================== 账号池 ====================
 
   /**
