@@ -43,6 +43,10 @@ export class AppleInitializationLimiterService {
   private readonly slotTtlMs = parsePositiveIntEnv('ROSETTAX_PROPERTY_APPLE_INIT_SLOT_TTL_MS', 10 * 60 * 1000);
   private readonly realtimeWaitMs = parsePositiveIntEnv('ROSETTAX_PROPERTY_APPLE_INIT_REALTIME_WAIT_MS', 80);
   private readonly backgroundWaitMs = parsePositiveIntEnv('ROSETTAX_PROPERTY_APPLE_INIT_BACKGROUND_WAIT_MS', 300);
+  private readonly backgroundWaitLogIntervalMs = parsePositiveIntEnv(
+    'ROSETTAX_PROPERTY_APPLE_INIT_BACKGROUND_WAIT_LOG_MS',
+    5_000,
+  );
 
   /**
    * @description 注入 Redis 连接.
@@ -88,6 +92,9 @@ export class AppleInitializationLimiterService {
    */
   private async acquireSlot(token: string, label: string, priority: AppleInitializationPriority): Promise<void> {
     const waitMs = priority === 'background' ? this.backgroundWaitMs : this.realtimeWaitMs;
+    const startedAt = Date.now();
+    let lastBackgroundWaitLogAt = 0;
+
     while (true) {
       const acquired = await this.redisService.getClient().eval(
         ACQUIRE_SLOT_SCRIPT,
@@ -100,10 +107,42 @@ export class AppleInitializationLimiterService {
       );
       if (acquired === 1) return;
       await this.sleep(waitMs);
-      if (priority === 'background') {
-        this.logger.debug(`[apple-init-limiter] 后台任务等待槽位: label=${label}`);
-      }
+      lastBackgroundWaitLogAt = this.logBackgroundSlotWaitIfNeeded(
+        priority,
+        label,
+        startedAt,
+        lastBackgroundWaitLogAt,
+      );
     }
+  }
+
+  /**
+   * @description 按固定间隔输出后台任务等待槽位日志, 避免高并发预热时每轮等待都刷屏.
+   * @param priority 当前任务优先级
+   * @param label 操作标签
+   * @param startedAt 开始等待的时间戳
+   * @param lastLogAt 上次输出等待日志的时间戳
+   * @returns 更新后的上次输出日志时间戳
+   * @sideEffects 后台任务达到日志间隔时写入 Nest debug 日志
+   */
+  private logBackgroundSlotWaitIfNeeded(
+    priority: AppleInitializationPriority,
+    label: string,
+    startedAt: number,
+    lastLogAt: number,
+  ): number {
+    if (priority !== 'background') return lastLogAt;
+
+    const now = Date.now();
+    if (lastLogAt > 0 && now - lastLogAt < this.backgroundWaitLogIntervalMs) {
+      return lastLogAt;
+    }
+
+    this.logger.debug(
+      `[apple-init-limiter] 后台任务等待槽位: label=${label}, ` +
+      `waited=${now - startedAt}ms, maxConcurrency=${this.maxConcurrency}`,
+    );
+    return now;
   }
 
   /**

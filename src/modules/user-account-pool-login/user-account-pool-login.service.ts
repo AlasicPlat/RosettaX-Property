@@ -237,14 +237,16 @@ export class UserAccountPoolLoginService {
             const balance = await this.refreshExchangeAccountBalance(task.sessionId);
             if (balance) {
               result.balance = balance;
+              result.creditBalance = balance;
               this.logger.log(
                 `[ExchangeLogin] 余额刷新成功: email=${task.email}, ` +
                 `${task.loginBalance || 'N/A'} → ${balance}, elapsed=${Date.now() - task.startedAt}ms`,
               );
             } else {
+              result.balanceError = '余额刷新返回空值';
               this.logger.warn(
                 `[ExchangeLogin] 余额刷新返回空值: email=${task.email}, ` +
-                `保留登录余额=${result.balance || 'N/A'}, elapsed=${Date.now() - task.startedAt}ms`,
+                `不返回缓存余额, elapsed=${Date.now() - task.startedAt}ms`,
               );
             }
           } catch (error: any) {
@@ -614,13 +616,17 @@ export class UserAccountPoolLoginService {
       if (loginResult.status === 'success' && loginResult.sessionId) {
         const storeFront = loginResult.account?.storeFront || '';
         const region = this.identityService.parseRegionFromStoreFront(storeFront);
-        let balance = loginResult.account?.creditDisplay || null;
+        let balance: string | null = null;
         let balanceError: string | undefined;
 
         if (options.refreshBalance !== false) {
           try {
             const refreshedBalance = await this.refreshExchangeAccountBalance(loginResult.sessionId);
-            if (refreshedBalance) balance = refreshedBalance;
+            if (refreshedBalance) {
+              balance = refreshedBalance;
+            } else {
+              balanceError = '余额刷新返回空值';
+            }
           } catch (error: any) {
             balanceError = error.message || '余额刷新失败';
             this.logger.warn(`[ExchangeLogin] 余额刷新失败: ${emailKey} — ${balanceError}`);
@@ -634,7 +640,7 @@ export class UserAccountPoolLoginService {
           region,
           storeFront,
           balance,
-          creditBalance: loginResult.account?.creditBalance || null,
+          creditBalance: balance,
           name: loginResult.account?.name,
           balanceError,
         };
@@ -672,9 +678,10 @@ export class UserAccountPoolLoginService {
   /**
    * @description 刷新兑换账号余额.
    *
-   * 登录响应已有 creditDisplay 时直接复用; 否则用 Apple Music account/information 补齐余额。
+   * 每次都用 Apple Music account/information 在线查询最新余额。
    * 首次查询失败时会刷新式 re-login 并重试一次, 保证 Redis 中 session/cookies 同步更新。
    * 该方法只服务兑换账号登录结果展示, 失败时不阻断账号登录成功。
+   * 注意: 登录响应里的 creditDisplay 可能是旧缓存, 不能作为刷新结果返回。
    *
    * @param sessionId Apple managed session ID
    * @returns 格式化余额; 无法获取时返回 null
@@ -683,10 +690,6 @@ export class UserAccountPoolLoginService {
     const session = await this.sessionManager.getLoggedInSession(sessionId);
     const account = session.account;
     if (!account) return null;
-
-    if (account.creditDisplay) {
-      return account.creditDisplay;
-    }
 
     const proxy = await this.sessionManager.getSessionProxy(session);
     try {
@@ -723,12 +726,13 @@ export class UserAccountPoolLoginService {
     }
 
     const refreshedSession = await this.sessionManager.getLoggedInSession(sessionId);
-    if (refreshedSession.account?.creditDisplay) {
-      return refreshedSession.account.creditDisplay;
+    if (!refreshedSession.account) {
+      this.logger.warn(`[ExchangeLogin] re-login 成功但 session 缺少账号数据: sessionId=${sessionId}`);
+      return null;
     }
 
     return this.itunesClient.fetchBalance(
-      refreshedSession.account!,
+      refreshedSession.account,
       refreshedSession.sessionCookies,
       refreshedSession.guid,
       await this.sessionManager.getSessionProxy(refreshedSession),
