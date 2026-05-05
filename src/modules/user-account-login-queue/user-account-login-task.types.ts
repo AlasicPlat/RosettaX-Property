@@ -53,6 +53,26 @@ export type LoginQueueTask =
     requestedAt: number;
   }
   | {
+    /** GiftCardExchanger 兑换账号手动 2FA 提交任务 */
+    type: 'exchange_submit_2fa';
+    /** 兑换账号 2FA job summary ID */
+    jobId: string;
+    /** Apple 登录返回的待 2FA session ID */
+    sessionId: string;
+    /** Apple ID 邮箱 */
+    email: string;
+    /** Apple ID 原始密码 */
+    password: string;
+    /** 6 位验证码 */
+    code: string;
+    /** 可选 2FA 接收地址 */
+    twoFAUrl?: string;
+    /** 用户组 ID */
+    groupId: number | null;
+    /** 任务创建时间戳 */
+    requestedAt: number;
+  }
+  | {
     /** 单账号后台 relogin 任务 */
     type: 'relogin';
     /** 用户组内账号身份 key */

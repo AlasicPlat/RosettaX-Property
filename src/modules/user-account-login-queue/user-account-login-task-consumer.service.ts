@@ -312,6 +312,9 @@ export class UserAccountLoginTaskConsumerService implements OnModuleInit, OnModu
       case 'exchange_login':
         await this.handleExchangeLogin(task);
         return;
+      case 'exchange_submit_2fa':
+        await this.handleExchangeSubmitTwoFactor(task);
+        return;
       case 'relogin':
         await this.handleRelogin(task);
         return;
@@ -337,6 +340,7 @@ export class UserAccountLoginTaskConsumerService implements OnModuleInit, OnModu
     await this.loginService.batchLogin(task.accounts, task.groupId, task.warmupRegions, {
       jobId: task.jobId,
       awaitWarmup: true,
+      limiterPriority: 'background',
     });
     await this.completeJobFromSummary(task.jobId);
   }
@@ -377,6 +381,10 @@ export class UserAccountLoginTaskConsumerService implements OnModuleInit, OnModu
    * @sideEffects 执行 Apple 登录、刷新余额并更新 Redis job summary
    */
   private async handleExchangeLogin(task: Extract<LoginQueueTask, { type: 'exchange_login' }>): Promise<void> {
+    this.logger.log(
+      `[ExchangeLogin] 收到兑换账号登录任务: jobId=${task.jobId}, ` +
+      `groupId=${task.groupId ?? 'global'}, total=${task.accounts.length}`,
+    );
     await this.cacheService.updateLoginWarmupJob(task.jobId, {
       status: 'logging_in',
       phase: 'logging_in',
@@ -386,6 +394,47 @@ export class UserAccountLoginTaskConsumerService implements OnModuleInit, OnModu
       jobId: task.jobId,
     });
     await this.completeJobFromSummary(task.jobId);
+  }
+
+  /**
+   * @description 处理 GiftCardExchanger 兑换账号手动 2FA 提交任务.
+   *
+   * 该任务不触发查询账号池预热, 只完成兑换账号 managed session 并把单账号
+   * 结果写回 Redis job summary, 供客户端同步等待或轮询读取。
+   *
+   * @param task exchange_submit_2fa 任务
+   * @sideEffects 提交 Apple 2FA、刷新余额并更新 Redis job summary
+   */
+  private async handleExchangeSubmitTwoFactor(task: Extract<LoginQueueTask, { type: 'exchange_submit_2fa' }>): Promise<void> {
+    this.logger.log(
+      `[ExchangeLogin] 收到兑换账号 2FA 任务: jobId=${task.jobId}, ` +
+      `email=${task.email}, sessionId=${task.sessionId}`,
+    );
+
+    await this.cacheService.updateLoginWarmupJob(task.jobId, {
+      status: 'logging_in',
+      phase: 'logging_in',
+    });
+
+    const result = await this.loginService.submitExchangeAccount2FA(
+      task.sessionId,
+      task.email,
+      task.password,
+      task.code,
+      task.groupId,
+      task.twoFAUrl,
+    );
+
+    await this.cacheService.updateLoginWarmupJob(task.jobId, {
+      status: result.status === 'success' ? 'completed' : 'partial_failed',
+      phase: 'done',
+      resultJson: JSON.stringify([result]),
+      nextPollMs: 1000,
+      loginFinished: 1,
+      loginSuccess: result.status === 'success' ? 1 : 0,
+      loginFailed: result.status === 'failed' ? 1 : 0,
+      loginNeeds2fa: result.status === 'needs_2fa' ? 1 : 0,
+    });
   }
 
   /**
@@ -406,7 +455,7 @@ export class UserAccountLoginTaskConsumerService implements OnModuleInit, OnModu
         [{ email: task.email, password: task.password, twoFAUrl: task.twoFAUrl }],
         task.groupId,
         undefined,
-        { awaitWarmup: false },
+        { awaitWarmup: false, limiterPriority: 'realtime' },
       );
     } finally {
       await this.releaseReloginDedupe(task);

@@ -30,6 +30,9 @@ import {
 const BAG_URL = 'https://init.itunes.apple.com/bag.xml?ix=6&os=14&locale=zh_CN';
 const DEFAULT_AUTH_URL = 'https://auth.itunes.apple.com/auth/v1/native';
 const DEFAULT_ACCOUNT_SUMMARY_URL = 'https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/accountSummary';
+/** Configurator User-Agent — 对齐 ipatool 当前默认登录客户端形态, 降低 Apple 侧对旧客户端的拒绝概率. */
+const ITUNES_CONFIGURATOR_USER_AGENT =
+  'Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6';
 /** StoreKitUIService User-Agent — Apple Music 账号信息链路沿用 iOS StoreKit 客户端形态. */
 const STOREKIT_USER_AGENT = 'StoreKitUIService/1.0 iOS/14.0 model/iPhone10,2 hwp/t8015 build/18A373 (6; dt:158)';
 /** StoreKit 客户端版本头 — Apple Music 账号信息链路沿用该客户端形态. */
@@ -193,6 +196,7 @@ export class ItunesClientService {
    * @param password 密码 (含 2FA 时密码+验证码拼接, 如 "mypassword123456")
    * @param guid 设备指纹 GUID
    * @param proxy 代理实例 (null 表示直连)
+   * @param existingSessionCookies 可选的已有登录 Cookie; 2FA/re-login 时用于复刻 Java 同一 AppleStoreClient 的 CookieJar
    * @returns LoginRawResult
    */
   async login(
@@ -200,6 +204,7 @@ export class ItunesClientService {
     password: string,
     guid: string,
     proxy: ProxyConfig | null,
+    existingSessionCookies?: Map<string, string>,
   ): Promise<LoginRawResult> {
     await this.fetchBag();
 
@@ -207,7 +212,7 @@ export class ItunesClientService {
     // this.logger.log(`  Auth URL: ${this.authUrl}`);
 
     let currentUrl = this.authUrl!;
-    const sessionCookies = new Map<string, string>();
+    const sessionCookies = existingSessionCookies ?? new Map<string, string>();
 
     // ipatool 重试逻辑: 最多 4 次尝试
     for (let attempt = 1; attempt <= 4; attempt++) {
@@ -223,6 +228,14 @@ export class ItunesClientService {
         why: 'signIn',
       };
       const plistBody = plist.build(payload);
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': ITUNES_CONFIGURATOR_USER_AGENT,
+      };
+      const loginCookieHeader = ItunesClientService.buildLoginCookieHeader(sessionCookies);
+      if (loginCookieHeader) {
+        headers.Cookie = loginCookieHeader;
+      }
 
       let response: any;
       try {
@@ -231,11 +244,7 @@ export class ItunesClientService {
             method: 'POST',
             url: currentUrl,
             data: plistBody,
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'User-Agent':
-                'Configurator/2.15 (Macintosh; OperatingSystem X 11.0.0; 16G29) AppleWebKit/2603.3.8',
-            },
+            headers,
             maxRedirects: 0,
             validateStatus: () => true,
           },
@@ -274,13 +283,21 @@ export class ItunesClientService {
         }
       }
 
-      // 解析响应 plist — 对标 Java L365-407
+      // 解析响应 plist — 对标 Java L365-407; 兼容 ipatool 会处理的 Document/plist/dict 包裹形态.
       let result: Record<string, any> | null = null;
       if (body && body.trim().length > 0) {
         try {
-          result = plist.parse(body) as Record<string, any>;
+          result = plist.parse(ItunesClientService.normalizeLoginResponseBody(body)) as Record<string, any>;
         } catch {
-          this.logger.warn('  响应 plist 解析失败');
+          this.logger.warn(
+            `  响应 plist 解析失败: ${ItunesClientService.buildLoginResponseDiagnostic(response, body, email)}`,
+          );
+          return {
+            success: false,
+            needs2FA: false,
+            errorMessage: `Apple 登录响应不是 plist: HTTP ${response.status}`,
+            sessionCookies,
+          };
         }
       }
 
@@ -1083,10 +1100,29 @@ export class ItunesClientService {
       'iCloud-DSID': dsid,
       'X-Dsid': dsid,
       'X-Apple-Store-Front': account.storeFront || '143465-19,29',
-      'User-Agent': 'Configurator/2.15 (Macintosh; OperatingSystem X 11.0.0; 16G29) AppleWebKit/2603.3.8',
+      'User-Agent': ITUNES_CONFIGURATOR_USER_AGENT,
       'X-Apple-Tz': '28800',
       ...anisetteHeaders,
     };
+  }
+
+  /**
+   * @description 构建 native login 请求使用的 Cookie header.
+   *
+   * Java AppleStoreClient 在 2FA/re-login 时复用同一个 OkHttp CookieJar, 会把首次
+   * challenge 阶段捕获的 Cookie 自动带回 auth.itunes.apple.com。Nest 是无状态服务,
+   * 因此需要把 Redis 中 `apple:session:{sessionId}:cookies` 重建出的 Cookie 显式回放。
+   *
+   * @param sessionCookies 当前 iTunes 登录会话 Cookie
+   * @returns 可直接放入 HTTP Cookie header 的字符串; 无 Cookie 时返回空串
+   */
+  private static buildLoginCookieHeader(sessionCookies: Map<string, string>): string {
+    const parts: string[] = [];
+    for (const [name, value] of sessionCookies) {
+      if (!name || !value) continue;
+      parts.push(`${name}=${value}`);
+    }
+    return parts.join('; ');
   }
 
   /**
@@ -1178,6 +1214,92 @@ export class ItunesClientService {
     const crypto = require('crypto');
     const seed = `${Date.now()}-${Math.random()}-apple-store-client-guid-salt`;
     return crypto.createHash('sha1').update(seed).digest('hex');
+  }
+
+  /**
+   * @description 规整 Apple 登录响应体, 兼容 Document / plist / dict 三种 XML 包裹.
+   *
+   * ipatool 在解析 XML 前会先抽取嵌入的 plist 或 dict; Apple 某些端点会在外层包
+   * Document/Protocol, 直接把完整响应交给 plist.parse 会误判为解析失败。
+   *
+   * @param body Apple 登录响应原文
+   * @returns 可交给 plist.parse 的 XML plist 字符串; 非 XML 响应保持原样以便上层报错
+   */
+  private static normalizeLoginResponseBody(body: string): string {
+    let normalized = body.trim();
+    if (!normalized) return normalized;
+
+    const documentMatch = /<Document\b[^>]*>([\s\S]*?)<\/Document>/i.exec(normalized);
+    if (documentMatch?.[1]?.trim()) {
+      normalized = documentMatch[1].trim();
+    }
+
+    const plistMatch = /<plist\b[^>]*>[\s\S]*?<\/plist>/i.exec(normalized);
+    if (plistMatch?.[0]?.trim()) {
+      return plistMatch[0].trim();
+    }
+
+    const dictMatch = /<dict\b[^>]*>[\s\S]*?<\/dict>/i.exec(normalized);
+    if (dictMatch?.[0]?.trim()) {
+      return ItunesClientService.wrapPlistDict(dictMatch[0].trim());
+    }
+
+    if (/<key\b[^>]*>/i.test(normalized)) {
+      return ItunesClientService.wrapPlistDict(`<dict>${normalized}</dict>`);
+    }
+
+    return normalized;
+  }
+
+  /**
+   * @description 给裸 dict XML 添加标准 plist 外壳.
+   *
+   * @param dictXml 已抽取的 dict XML
+   * @returns 完整 XML plist 字符串
+   */
+  private static wrapPlistDict(dictXml: string): string {
+    return [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      `<plist version="1.0">${dictXml}</plist>`,
+    ].join('');
+  }
+
+  /**
+   * @description 构造登录响应解析失败时的脱敏诊断信息.
+   *
+   * @param response Axios 响应对象
+   * @param body 响应正文
+   * @param email 当前 Apple ID, 用于从响应片段中脱敏
+   * @returns 单行诊断摘要
+   */
+  private static buildLoginResponseDiagnostic(response: any, body: string, email: string): string {
+    const contentType = response.headers?.['content-type'] || response.headers?.['Content-Type'] || 'unknown';
+    const location = response.headers?.location || response.headers?.Location || '';
+    const snippet = ItunesClientService.summarizeLoginResponseBody(body, email);
+    return [
+      `status=${response.status}`,
+      `contentType=${contentType}`,
+      `location=${location || '-'}`,
+      `body="${snippet}"`,
+    ].join(', ');
+  }
+
+  /**
+   * @description 生成安全的响应正文片段, 避免日志输出完整 HTML 或账号邮箱.
+   *
+   * @param body 响应正文
+   * @param email 当前 Apple ID
+   * @returns 最多 240 字符的单行脱敏片段
+   */
+  private static summarizeLoginResponseBody(body: string, email: string): string {
+    const escapedEmail = email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return body
+      .replace(new RegExp(escapedEmail, 'gi'), '***')
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '***')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 240);
   }
 
   /**

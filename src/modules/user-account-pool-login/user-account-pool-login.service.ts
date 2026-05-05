@@ -13,6 +13,7 @@ import { SessionManagerService } from '../itunes-client/session-manager.service'
 import { AppleInitializationLimiterService } from '../apple-initialization-limiter/apple-initialization-limiter.service';
 import { UserAccountPoolIdentityService } from '../user-account-pool-core/user-account-pool-identity.service';
 import { UserAccountPoolStateService } from '../user-account-pool-state/user-account-pool-state.service';
+import { UserAccountTwoFactorService } from '../user-account-two-factor/user-account-two-factor.service';
 import {
   LoginWarmupAccountInput,
   LoginWarmupOperator,
@@ -38,6 +39,10 @@ function parsePositiveIntEnv(key: string, fallback: number): number {
 const LOGIN_CONCURRENCY = parsePositiveIntEnv('ROSETTAX_PROPERTY_LOGIN_CONCURRENCY', 5);
 /** GiftCardExchanger 兑换账号余额刷新并发数. */
 const EXCHANGE_BALANCE_REFRESH_CONCURRENCY = parsePositiveIntEnv('ROSETTAX_PROPERTY_EXCHANGE_BALANCE_CONCURRENCY', 3);
+/** GiftCardExchanger 自动拉取 2FA 验证码的最大尝试次数. */
+const EXCHANGE_2FA_FETCH_ATTEMPTS = parsePositiveIntEnv('ROSETTAX_PROPERTY_EXCHANGE_2FA_FETCH_ATTEMPTS', 8);
+/** GiftCardExchanger 自动拉取 2FA 验证码的重试间隔毫秒. */
+const EXCHANGE_2FA_FETCH_RETRY_DELAY_MS = parsePositiveIntEnv('ROSETTAX_PROPERTY_EXCHANGE_2FA_FETCH_RETRY_DELAY_MS', 3000);
 
 /**
  * @description GiftCardExchanger 兑换账号登录结果.
@@ -87,6 +92,7 @@ export class UserAccountPoolLoginService {
     private readonly cacheService: DistributedCacheService,
     private readonly identityService: UserAccountPoolIdentityService,
     private readonly stateService: UserAccountPoolStateService,
+    private readonly twoFactorService: UserAccountTwoFactorService,
   ) { }
 
   /**
@@ -157,10 +163,17 @@ export class UserAccountPoolLoginService {
     warmupRegions?: string[],
     options: LoginWarmupRunOptions = {},
   ): Promise<UserLoginResult[]> {
+    const limiterPriority = options.limiterPriority ?? 'background';
     const results = await this.mapWithConcurrencyLimit(
       accounts,
       LOGIN_CONCURRENCY,
-      (account) => this.loginSingleAccount(account.email, account.password, groupId, account.twoFAUrl),
+      (account) => this.loginSingleAccount(
+        account.email,
+        account.password,
+        groupId,
+        account.twoFAUrl || account.verifyUrl,
+        limiterPriority,
+      ),
     );
 
     if (options.jobId) {
@@ -205,6 +218,7 @@ export class UserAccountPoolLoginService {
     for (let index = 0; index < accounts.length; index++) {
       const account = accounts[index];
       const result = await this.loginSingleExchangeAccount(account.email, account.password, groupId, {
+        twoFAUrl: account.twoFAUrl || account.verifyUrl,
         refreshBalance: false,
       });
       results[index] = result;
@@ -295,6 +309,7 @@ export class UserAccountPoolLoginService {
           entry.password,
           code,
           groupId,
+          entry.twoFAUrl,
         ),
       );
 
@@ -493,6 +508,7 @@ export class UserAccountPoolLoginService {
     await this.batchLogin(accounts, groupId, warmupRegions, {
       jobId,
       awaitWarmup: true,
+      limiterPriority: 'background',
     });
 
     const summary = await this.redisService.getClient()
@@ -601,17 +617,37 @@ export class UserAccountPoolLoginService {
     email: string,
     password: string,
     groupId: number | null,
-    options: { refreshBalance?: boolean } = {},
+    options: { refreshBalance?: boolean; twoFAUrl?: string } = {},
   ): Promise<ExchangeAccountLoginResult> {
     const emailKey = email.toLowerCase();
     const startedAt = Date.now();
 
     try {
-      const loginResult = await this.initializationLimiter.run(
+      this.logger.log(
+        `[ExchangeLogin] 准备登录兑换账号: email=${emailKey}, ` +
+        `groupId=${groupId ?? 'global'}, has2FAUrl=${options.twoFAUrl ? 'yes' : 'no'}`,
+      );
+      let loginResult = await this.initializationLimiter.run(
         `exchange-login:${emailKey}`,
         'realtime',
-        () => this.sessionManager.login(emailKey, password, { groupId }),
+        () => this.sessionManager.login(emailKey, password, { groupId, verifyUrl: options.twoFAUrl }),
       );
+
+      if (loginResult.status === 'needs_2fa' && loginResult.sessionId) {
+        const autoSubmitResult = await this.tryAutoSubmitExchangeTwoFactor({
+          email: emailKey,
+          password,
+          sessionId: loginResult.sessionId,
+          groupId,
+          twoFAUrl: options.twoFAUrl,
+          notBeforeMs: Date.now(),
+          startedAt,
+        });
+
+        if (autoSubmitResult?.status === 'success') {
+          loginResult = autoSubmitResult;
+        }
+      }
 
       if (loginResult.status === 'success' && loginResult.sessionId) {
         const storeFront = loginResult.account?.storeFront || '';
@@ -671,6 +707,219 @@ export class UserAccountPoolLoginService {
         email: emailKey,
         status: 'failed',
         errorMessage: error.message || '登录异常',
+      };
+    }
+  }
+
+  /**
+   * @description 在 Apple 已返回 2FA challenge 后, 尝试从配置 URL 拉码并自动提交.
+   *
+   * 自动提交只是 GiftCardExchanger 的加速路径; 任何拉码或提交失败都会回退到
+   * 原 `needs_2fa` 结果, 由客户端继续弹窗让用户手动输入验证码。
+   *
+   * @param params 自动 2FA 上下文
+   * @returns Apple 2FA 提交成功结果; 不可自动完成时返回 null
+   * @sideEffects 请求用户配置的 2FA URL, 成功取码后向 Apple 提交验证码
+   */
+  private async tryAutoSubmitExchangeTwoFactor(params: {
+    email: string;
+    password: string;
+    sessionId: string;
+    groupId: number | null;
+    twoFAUrl?: string;
+    notBeforeMs: number;
+    startedAt: number;
+  }): Promise<LoginResultDto | null> {
+    if (!params.twoFAUrl) {
+      return null;
+    }
+
+    this.logger.log(
+      `[ExchangeLogin] Apple 登录已返回 2FA challenge, 开始轮询验证码 URL: ` +
+      `email=${params.email}, sessionId=${params.sessionId}`,
+    );
+
+    const code = await this.fetchExchangeTwoFactorCode(params.twoFAUrl, params.email, params.notBeforeMs);
+    if (!code) {
+      this.logger.warn(`[ExchangeLogin] 自动获取 2FA 验证码失败, 等待手动输入: email=${params.email}`);
+      return null;
+    }
+
+    const result = await this.initializationLimiter.run(
+      `exchange-auto-submit-2fa:${params.email}`,
+      'realtime',
+      () => this.sessionManager.submit2FA(
+        params.sessionId,
+        params.email,
+        params.password,
+        code,
+        params.groupId,
+        params.twoFAUrl,
+      ),
+    );
+
+    this.logger.log(
+      `[ExchangeLogin] 自动 2FA 提交完成: email=${params.email}, ` +
+      `status=${result.status}, elapsed=${Date.now() - params.startedAt}ms`,
+    );
+
+    if (result.status !== 'success') {
+      this.logger.warn(
+        `[ExchangeLogin] 自动 2FA 未成功, 等待手动输入: email=${params.email}, ` +
+        `error=${result.errorMessage || 'unknown'}`,
+      );
+      return null;
+    }
+
+    return result;
+  }
+
+  /**
+   * @description 短轮询 2FA URL 获取本次 Apple challenge 对应的新验证码.
+   * @param twoFAUrl 2FA 验证码获取 URL
+   * @param emailKey 小写 Apple ID 邮箱, 用于日志
+   * @param notBeforeMs 本次 Apple 2FA challenge 的开始时间
+   * @returns 6 位验证码; 超时未取到时返回 null
+   */
+  private async fetchExchangeTwoFactorCode(
+    twoFAUrl: string,
+    emailKey: string,
+    notBeforeMs: number,
+  ): Promise<string | null> {
+    for (let attempt = 1; attempt <= EXCHANGE_2FA_FETCH_ATTEMPTS; attempt++) {
+      const code = await this.twoFactorService.fetch2FACode(twoFAUrl, {
+        notBefore: notBeforeMs,
+        notBeforeSkewMs: 10000,
+      });
+      if (code) {
+        return code;
+      }
+
+      if (attempt < EXCHANGE_2FA_FETCH_ATTEMPTS) {
+        this.logger.warn(
+          `[ExchangeLogin] 2FA 验证码暂不可用, 等待后重试: ` +
+          `email=${emailKey}, attempt=${attempt}/${EXCHANGE_2FA_FETCH_ATTEMPTS}`,
+        );
+        await this.sleep(EXCHANGE_2FA_FETCH_RETRY_DELAY_MS);
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * @description 等待指定毫秒数.
+   * @param milliseconds 等待时长
+   * @returns 等待完成 Promise
+   */
+  private sleep(milliseconds: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+
+  /**
+   * @description 为 GiftCardExchanger 兑换账号提交手动 2FA 验证码.
+   *
+   * 该流程只完成兑换用 managed session, 不调用账号池 handleLoginSuccess,
+   * 避免把兑换账号写入礼品卡余额查询账号池。
+   *
+   * @param sessionId Apple 登录第一步返回的待 2FA session ID
+   * @param email Apple ID 邮箱
+   * @param password Apple ID 原始密码
+   * @param code 6 位 Apple 验证码
+   * @param groupId 当前用户组 ID
+   * @param twoFAUrl 可选 2FA URL, 成功后持久化到 apple_account.verifyUrl
+   * @returns 兑换账号登录结果
+   */
+  async submitExchangeAccount2FA(
+    sessionId: string,
+    email: string,
+    password: string,
+    code: string,
+    groupId: number | null,
+    twoFAUrl?: string,
+  ): Promise<ExchangeAccountLoginResult> {
+    const emailKey = email.toLowerCase();
+    const startedAt = Date.now();
+
+    try {
+      this.logger.log(
+        `[ExchangeLogin] 提交兑换账号验证码: email=${emailKey}, ` +
+        `sessionId=${sessionId}, groupId=${groupId ?? 'global'}`,
+      );
+
+      const submitResult = await this.initializationLimiter.run(
+        `exchange-submit-2fa:${emailKey}`,
+        'realtime',
+        () => this.sessionManager.submit2FA(
+          sessionId,
+          emailKey,
+          password,
+          code,
+          groupId,
+          twoFAUrl,
+        ),
+      );
+
+      if (submitResult.status === 'success' && submitResult.sessionId) {
+        const storeFront = submitResult.account?.storeFront || '';
+        const region = this.identityService.parseRegionFromStoreFront(storeFront);
+        let balance: string | null = null;
+        let balanceError: string | undefined;
+
+        try {
+          balance = await this.refreshExchangeAccountBalance(submitResult.sessionId);
+          if (!balance) {
+            balanceError = '余额刷新返回空值';
+          }
+        } catch (error: any) {
+          balanceError = error.message || '余额刷新失败';
+          this.logger.warn(`[ExchangeLogin] 2FA 后余额刷新失败: ${emailKey} — ${balanceError}`);
+        }
+
+        this.logger.log(
+          `[ExchangeLogin] 兑换账号 2FA 成功: email=${emailKey}, ` +
+          `region=${region || 'unknown'}, elapsed=${Date.now() - startedAt}ms`,
+        );
+
+        return {
+          email: emailKey,
+          status: 'success',
+          sessionId: submitResult.sessionId,
+          region,
+          storeFront,
+          balance,
+          creditBalance: balance,
+          name: submitResult.account?.name,
+          balanceError,
+        };
+      }
+
+      if (submitResult.status === 'needs_2fa' && submitResult.sessionId) {
+        return {
+          email: emailKey,
+          status: 'needs_2fa',
+          sessionId: submitResult.sessionId,
+          errorMessage: submitResult.errorMessage || '需要输入 2FA 验证码',
+        };
+      }
+
+      this.logger.warn(
+        `[ExchangeLogin] 兑换账号 2FA 失败: email=${emailKey}, ` +
+        `error=${submitResult.errorMessage || '未知错误'}, elapsed=${Date.now() - startedAt}ms`,
+      );
+      return {
+        email: emailKey,
+        status: 'failed',
+        sessionId,
+        errorMessage: submitResult.errorMessage || '2FA 验证失败',
+      };
+    } catch (error: any) {
+      this.logger.error(`[ExchangeLogin] 兑换账号 2FA 异常: ${emailKey} — ${error.message}`, error.stack);
+      return {
+        email: emailKey,
+        status: 'failed',
+        sessionId,
+        errorMessage: error.message || '2FA 提交异常',
       };
     }
   }
@@ -777,6 +1026,7 @@ export class UserAccountPoolLoginService {
     password: string,
     groupId: number | null,
     twoFAUrl?: string,
+    limiterPriority: 'realtime' | 'background' = 'background',
   ): Promise<UserLoginResult> {
     const emailKey = email.toLowerCase();
     const accountKey = this.identityService.buildAccountIdentity(emailKey, groupId);
@@ -784,8 +1034,8 @@ export class UserAccountPoolLoginService {
     try {
       const loginResult = await this.initializationLimiter.run(
         `account-login:${accountKey}`,
-        'realtime',
-        () => this.sessionManager.login(email, password, { groupId }),
+        limiterPriority,
+        () => this.sessionManager.login(email, password, { groupId, verifyUrl: twoFAUrl }),
       );
 
       if (loginResult.status === 'success' && loginResult.sessionId) {
@@ -994,7 +1244,7 @@ export class UserAccountPoolLoginService {
     const loginResult = await this.initializationLimiter.run(
       `managed-refresh:${accountKey}`,
       'realtime',
-      () => this.sessionManager.login(emailKey, password, { groupId }),
+      () => this.sessionManager.login(emailKey, password, { groupId, verifyUrl: twoFAUrl }),
     );
 
     if (loginResult.status === 'success' && loginResult.sessionId) {

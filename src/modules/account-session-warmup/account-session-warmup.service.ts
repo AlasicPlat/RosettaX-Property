@@ -53,7 +53,13 @@ const DEFAULT_WARMUP_TARGETS: Record<string, number> = {
   '/br': 1,
 };
 
-type WarmupAccount = { email: string; password: string; accountKey?: string; groupId?: number | null };
+type WarmupAccount = {
+  email: string;
+  password: string;
+  twoFAUrl?: string;
+  accountKey?: string;
+  groupId?: number | null;
+};
 type GroupWarmupCapacityResult = {
   groupId: number | null;
   accountCount: number;
@@ -81,6 +87,7 @@ export interface PlannedAccountWarmupTask {
   account: {
     email: string;
     password: string;
+    twoFAUrl?: string;
     accountKey: string;
     groupId: number | null;
   };
@@ -294,6 +301,7 @@ export class AccountSessionWarmupService {
         account: {
           email,
           password: account.password,
+          twoFAUrl: account.twoFAUrl,
           accountKey,
           groupId,
         },
@@ -576,6 +584,7 @@ export class AccountSessionWarmupService {
         account: {
           email: primaryAccount.email,
           password: primaryAccount.password,
+          twoFAUrl: primaryAccount.twoFAUrl,
           accountKey: primaryAccountKey,
           groupId: primaryAccount.groupId ?? null,
         },
@@ -809,6 +818,7 @@ export class AccountSessionWarmupService {
       warmupAccounts.push({
         email,
         password: account.password,
+        twoFAUrl: account.verifyUrl || undefined,
         groupId,
         accountKey,
       });
@@ -834,6 +844,7 @@ export class AccountSessionWarmupService {
       groupId,
       email: account.email.toLowerCase(),
       password: account.password,
+      twoFAUrl: account.verifyUrl || existing?.twoFAUrl,
       sessionId: existing?.sessionId,
       region: account.region || existing?.region || 'unknown',
       creditDisplay: account.creditDisplay || existing?.creditDisplay,

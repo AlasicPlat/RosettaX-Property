@@ -6,8 +6,35 @@ import { RedisService } from '../../database/redis.service';
 /** Redis Lua 脚本: 原子获取全局 Apple 初始化并发槽位. */
 const ACQUIRE_SLOT_SCRIPT = `
 redis.call("ZREMRANGEBYSCORE", KEYS[1], 0, tonumber(ARGV[1]) - tonumber(ARGV[3]))
-local current = redis.call("ZCARD", KEYS[1])
-if current < tonumber(ARGV[2]) then
+local members = redis.call("ZRANGE", KEYS[1], 0, -1)
+local current = #members
+local maxConcurrency = tonumber(ARGV[2])
+local reserveSlots = tonumber(ARGV[5])
+local realtimeBurstSlots = tonumber(ARGV[6])
+local priority = ARGV[7]
+local backgroundCount = 0
+for _, member in ipairs(members) do
+  if string.sub(member, 1, 9) ~= "realtime:" then
+    backgroundCount = backgroundCount + 1
+  end
+end
+local backgroundLimit = maxConcurrency - reserveSlots
+if backgroundLimit < 1 then
+  backgroundLimit = 1
+end
+local allowedTotal = maxConcurrency
+if priority == "realtime" and backgroundCount >= backgroundLimit then
+  allowedTotal = maxConcurrency + realtimeBurstSlots
+end
+if priority == "background" then
+  if current < maxConcurrency and backgroundCount < backgroundLimit then
+    redis.call("ZADD", KEYS[1], ARGV[1], ARGV[4])
+    redis.call("EXPIRE", KEYS[1], math.ceil(tonumber(ARGV[3]) / 1000))
+    return 1
+  end
+  return 0
+end
+if current < allowedTotal then
   redis.call("ZADD", KEYS[1], ARGV[1], ARGV[4])
   redis.call("EXPIRE", KEYS[1], math.ceil(tonumber(ARGV[3]) / 1000))
   return 1
@@ -41,6 +68,8 @@ export class AppleInitializationLimiterService {
   private readonly limiterKey = process.env.ROSETTAX_PROPERTY_APPLE_INIT_LIMITER_KEY || 'rx:limiter:apple-init';
   private readonly maxConcurrency = parsePositiveIntEnv('ROSETTAX_PROPERTY_APPLE_INIT_GLOBAL_CONCURRENCY', 4);
   private readonly slotTtlMs = parsePositiveIntEnv('ROSETTAX_PROPERTY_APPLE_INIT_SLOT_TTL_MS', 10 * 60 * 1000);
+  private readonly realtimeReserveSlots = parsePositiveIntEnv('ROSETTAX_PROPERTY_APPLE_INIT_REALTIME_RESERVED_SLOTS', 1);
+  private readonly realtimeBurstSlots = parsePositiveIntEnv('ROSETTAX_PROPERTY_APPLE_INIT_REALTIME_BURST_SLOTS', 1);
   private readonly realtimeWaitMs = parsePositiveIntEnv('ROSETTAX_PROPERTY_APPLE_INIT_REALTIME_WAIT_MS', 80);
   private readonly backgroundWaitMs = parsePositiveIntEnv('ROSETTAX_PROPERTY_APPLE_INIT_BACKGROUND_WAIT_MS', 300);
   private readonly backgroundWaitLogIntervalMs = parsePositiveIntEnv(
@@ -67,7 +96,7 @@ export class AppleInitializationLimiterService {
     priority: AppleInitializationPriority,
     handler: () => Promise<T>,
   ): Promise<T> {
-    const token = `${hostname()}-${process.pid}-${randomUUID()}`;
+    const token = `${priority}:${hostname()}-${process.pid}-${randomUUID()}`;
     const startedAt = Date.now();
     await this.acquireSlot(token, label, priority);
     try {
@@ -85,6 +114,11 @@ export class AppleInitializationLimiterService {
 
   /**
    * @description 循环等待并获取一个全局并发槽位.
+   *
+   * background 任务最多占用 `maxConcurrency - realtimeReserveSlots` 个槽位, 避免大批量
+   * 账号预热把兑换登录、2FA 等用户实时链路完全堵住。若历史 background token 已经占满
+   * 全局槽位, realtime 允许使用少量 burst 槽位恢复可用性。
+   *
    * @param token 当前任务槽位 token
    * @param label 操作标签
    * @param priority 优先级
@@ -104,6 +138,9 @@ export class AppleInitializationLimiterService {
         this.maxConcurrency,
         this.slotTtlMs,
         token,
+        this.realtimeReserveSlots,
+        this.realtimeBurstSlots,
+        priority,
       );
       if (acquired === 1) return;
       await this.sleep(waitMs);

@@ -63,11 +63,13 @@ const STOREFRONT_TO_REGION: Record<string, string> = {
  * @property existingGuid 显式复用的设备指纹 GUID; 未传时优先复用 apple_account.guid
  * @property region 显式账号地区; 未传时优先从登录响应 storeFront 解析
  * @property groupId 当前用户组 ID; 用于 apple_account 入库归属
+ * @property verifyUrl 可选 2FA 验证码获取 URL; 成功登录后持久化到 apple_account
  */
 export interface SessionLoginOptions {
   existingGuid?: string;
   region?: string;
   groupId?: number | null;
+  verifyUrl?: string;
 }
 
 @Injectable()
@@ -131,10 +133,15 @@ export class SessionManagerService {
             options.region || existing.region || undefined,
             options.groupId ?? existing.groupId ?? null,
             existingAccount,
+            options.verifyUrl,
           );
-        } else if (existingAccount && existingAccount.password !== password) {
-          await this.accountService.upsert({ email: normalizedEmail, password });
-          this.logger.log(`[SessionManager] 已更新现有账号明文密码: ${normalizedEmail}`);
+        } else if (existingAccount && (existingAccount.password !== password || options.verifyUrl !== undefined)) {
+          await this.accountService.upsert({
+            email: normalizedEmail,
+            password,
+            verifyUrl: options.verifyUrl ?? existingAccount.verifyUrl ?? '',
+          });
+          this.logger.log(`[SessionManager] 已更新现有账号登录凭据: ${normalizedEmail}`);
         }
         return {
           status: 'success',
@@ -146,8 +153,8 @@ export class SessionManagerService {
       await this.cleanupSession(existingSessionId);
     }
 
-    // 随机代理
-    const proxy = await this.proxyService.acquireRandom();
+    // 登录与后续 2FA 必须绑定同一 sticky 代理, 否则 Apple 会把密码+验证码提交判为异常登录.
+    const proxy = await this.proxyService.acquireForAccount(normalizedEmail);
     // this.logger.log(
     //   `[SessionManager] 已分配代理: sessionTag=${proxy.sessionTag}, username=${proxy.username}`,
     // );
@@ -191,7 +198,7 @@ export class SessionManagerService {
       // );
 
       // 持久化到 MySQL — 对标 Java L165
-      await this.persistAccount(result.account, password, guid, options.region, options.groupId, existingAccount);
+      await this.persistAccount(result.account, password, guid, options.region, options.groupId, existingAccount, options.verifyUrl);
       // 持久化到 Redis — 对标 Java L168
       await this.persistSession(sessionId, session);
 
@@ -230,9 +237,9 @@ export class SessionManagerService {
   /**
    * @description 提交 2FA 验证码 (第二步) — 对标 Java AccountManager.submit2FA().
    *
-   * 复用同一 session 的代理 (同一出口 IP), 用密码+验证码重新登录.
-   * 20260414 修复: 通过 acquireForAccount(email) 自动命中已有 sessionTag,
-   * 保证 2FA 验证时出口 IP 与首次登录一致, 避免触发风控.
+   * 复用同一 session 的代理和登录 Cookie, 用密码+验证码重新登录.
+   * 这里必须以 Redis 中的 `apple:session:{sessionId}:cookies` 作为 iTunes 登录上下文,
+   * 对齐 Java managed.getClient().login(email, password + code) 的 CookieJar 复用行为.
    *
    * Reference: AccountManager.java L201-234
    *
@@ -249,6 +256,7 @@ export class SessionManagerService {
     password: string,
     code: string,
     groupId?: number | null,
+    verifyUrl?: string,
   ): Promise<LoginResultDto> {
     this.logger.log(`[SessionManager] 2FA 验证: sessionId=${sessionId}`);
 
@@ -261,16 +269,23 @@ export class SessionManagerService {
       return { status: 'failed', errorMessage: `当前会话状态不是等待 2FA: ${session.status}` };
     }
 
-    // 复用同一账号的 sticky session 代理 — acquireForAccount 自动命中内存缓存
-    // 修复原实现中 getRandomActive() 每次返回不同代理导致 IP 切换的 bug
     const normalizedEmail = email.toLowerCase();
-    const proxy = await this.proxyService.acquireForAccount(normalizedEmail);
+    const proxy = await this.getSessionProxy(session);
+    if (!session.guid) {
+      return { status: 'failed', errorMessage: '待验证会话缺少设备 GUID, 请重新登录该账号后再提交验证码' };
+    }
 
     // 密码 + 验证码拼接 — 对标 Java L217
     session.password = password; // 保存原始密码 (不含验证码)
     const passwordWith2FA = password + code;
 
-    const result = await this.itunesClient.login(normalizedEmail, passwordWith2FA, session.guid, proxy);
+    const result = await this.itunesClient.login(
+      normalizedEmail,
+      passwordWith2FA,
+      session.guid,
+      proxy,
+      session.sessionCookies,
+    );
 
     if (result.success && result.account) {
       const effectiveGroupId = groupId ?? session.groupId ?? null;
@@ -281,7 +296,7 @@ export class SessionManagerService {
 
       this.logger.log(`[SessionManager] 2FA 验证成功: ${normalizedEmail}, creditDisplay=${result.account.creditDisplay}`);
 
-      await this.persistAccount(result.account, session.password, session.guid, session.region || undefined, effectiveGroupId);
+      await this.persistAccount(result.account, session.password, session.guid, session.region || undefined, effectiveGroupId, null, verifyUrl);
       await this.persistSession(sessionId, session);
 
       return {
@@ -313,7 +328,13 @@ export class SessionManagerService {
     }
 
     const proxy = await this.getSessionProxy(session);
-    const result = await this.itunesClient.login(session.email, session.password, session.guid, proxy);
+    const result = await this.itunesClient.login(
+      session.email,
+      session.password,
+      session.guid,
+      proxy,
+      session.sessionCookies,
+    );
 
     if (result.success && result.account) {
       session.account = result.account;
@@ -485,10 +506,12 @@ export class SessionManagerService {
   /**
    * @description 获取会话绑定的代理配置 — 用于 RedeemService 等发起请求.
    *
-   * 通过 acquireForAccount 自动命中内存缓存的 sessionTag, 保证 IP 一致性.
+   * 优先使用 ManagedSession 中保存的 sessionTag, 防止账号映射被清理后意外换 IP.
    */
   async getSessionProxy(session: ManagedSession): Promise<ProxyConfig> {
-    return this.proxyService.acquireForAccount(session.email);
+    return session.proxySessionTag
+      ? this.proxyService.getConfigForSessionTag(session.proxySessionTag)
+      : this.proxyService.acquireForAccount(session.email);
   }
 
   // ==================== 持久化辅助方法 ====================
@@ -506,6 +529,7 @@ export class SessionManagerService {
    * @param region 可选 — 账号所属国家/地区 (来自 query_account_pool)
    * @param groupId 当前用户组 ID; null/undefined 时保留历史记录或写入全局组 0
    * @param knownExistingAccount 可选的已查询账号记录, 避免重复读取数据库
+   * @param verifyUrl 可选 2FA 验证码获取 URL; 未传时保留已有值
    */
   private async persistAccount(
     account: SessionAccountData,
@@ -514,6 +538,7 @@ export class SessionManagerService {
     region?: string,
     groupId?: number | null,
     knownExistingAccount?: AppleAccount | null,
+    verifyUrl?: string | null,
   ): Promise<void> {
     try {
       const normalizedEmail = account.email.toLowerCase();
@@ -527,6 +552,7 @@ export class SessionManagerService {
         groupId: persistedGroupId,
         email: normalizedEmail,
         password: plainPassword,
+        verifyUrl: verifyUrl ?? existingAccount?.verifyUrl ?? '',
         name: account.name || '',
         dsid: account.directoryServicesId || '',
         storeFront: account.storeFront || '',
@@ -544,23 +570,11 @@ export class SessionManagerService {
       // 优先使用显式传入的 region → 其次从 storeFront 解析 → 兜底 'unknown'
       data.region = region || existingAccount?.region || this.parseRegionFromStoreFront(account.storeFront || '') || 'unknown';
 
-      // [DEBUG] 诊断 apple_account 写入问题 — 打印完整入库数据
-      this.logger.log(
-        `[SessionManager][DEBUG] persistAccount 准备写入: email=${normalizedEmail}, groupId=${persistedGroupId}, ` +
-        `region=${data.region}, guid=${persistedGuid}, existingAccount=${existingAccount ? 'YES(id=' + existingAccount.id + ')' : 'NO'}, ` +
-        `passwordToken=${account.passwordToken ? 'YES(' + account.passwordToken.length + 'chars)' : 'NULL'}, ` +
-        `clearToken=${account.clearToken ? 'YES' : 'NULL'}, dsid=${data.dsid || 'EMPTY'}`,
-      );
-
       await this.accountService.upsert(data);
       if (passwordChanged) {
         this.logger.log(`[SessionManager] 已更新现有账号明文密码: ${normalizedEmail}`);
       }
-
-      // [DEBUG] 确认写入成功
-      this.logger.log(`[SessionManager][DEBUG] persistAccount 写入成功: ${normalizedEmail}`);
     } catch (error: any) {
-      // [DEBUG] 增强错误日志 — 打印完整堆栈和入库参数
       this.logger.error(
         `[SessionManager] 持久化账号失败: ${account.email} — ${error.message}\n` +
         `  入参: guid=${guid}, region=${region}, groupId=${groupId}\n` +
@@ -591,13 +605,14 @@ export class SessionManagerService {
         status: session.status,
         loginTime: String(session.loginTime),
         proxySessionTag: session.proxySessionTag,
+        guid: session.guid || '',
+        region: session.region || '',
       };
       if (session.groupId !== undefined && session.groupId !== null) {
         metadata.groupId = String(session.groupId);
       }
       if (session.account) {
         metadata.dsid = session.account.directoryServicesId || '';
-        metadata.guid = session.guid;
       }
 
       // 使用 Redis pipeline 写入元数据
@@ -685,7 +700,7 @@ export class SessionManagerService {
         loginTime: parseInt(meta.loginTime || '0', 10),
         proxySessionTag: meta.proxySessionTag || '',
         guid: meta.guid || dbAccount?.guid || '',
-        region: dbAccount?.region || '',
+        region: meta.region || dbAccount?.region || '',
         account,
         sessionCookies,
       };

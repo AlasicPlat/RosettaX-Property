@@ -90,6 +90,7 @@ export interface LoginWarmupAccountInput {
   email: string;
   password: string;
   twoFAUrl?: string;
+  verifyUrl?: string;
 }
 
 /**
@@ -108,6 +109,8 @@ export interface WarmupAccountCredential {
 export interface LoginWarmupRunOptions {
   jobId?: string;
   awaitWarmup?: boolean;
+  /** Apple 初始化限流优先级; 大批量预热用 background, 用户实时链路用 realtime. */
+  limiterPriority?: 'realtime' | 'background';
 }
 
 /**

@@ -35,6 +35,10 @@ export class AppleAccount {
   @Column({ type: 'varchar', length: 255, comment: '密码' })
   password: string;
 
+  /** 2FA 验证码获取 URL — 用于后续自动化登录或 relogin 时拉取验证码 */
+  @Column({ name: 'verify_url', type: 'varchar', length: 512, default: '', comment: '验证码链接' })
+  verifyUrl: string;
+
   /** 国家/地区 — cn/jp/sg/us等 */
   @Column({ type: 'varchar', length: 32, comment: '国家/地区 (cn/jp/sg/us等)' })
   region: string;
